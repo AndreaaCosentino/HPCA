@@ -59,7 +59,7 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 	int tid = threadIdx.x;
 
 	sdata[tid] = expf(-calculate_Price(sigma,dt,a,rs,s,t,states));
-	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+0.1,states) - calculate_Price(sigma,dt,a,rs,s,t-0.1,states) )/2;
+	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+0.1,states) - calculate_Price(sigma,dt,a,rs,s,t-0.1,states) )/(2*0.1);
 	
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
@@ -81,7 +81,7 @@ int main(void) {
 	float sigma = 0.1;
 	float s = 0;
 	float t = 5.0;
-	float dt = 0.001;
+	float dt = 0.01;
 	float rzero = 0.012;
 	float a = 1.0;
 	float* PGPU; 
