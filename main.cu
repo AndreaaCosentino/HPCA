@@ -6,10 +6,11 @@
 
 #include <stdio.h>
 #include <curand_kernel.h>
+#include <math.h>
 
 #define NB 2048
 #define NTPB 1024
-#define T 10;
+#define T 10
 
 // Function that catches the error 
 void testCUDA(cudaError_t error, const char* file, int line) {
@@ -82,7 +83,7 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 __device__ float theta(float* f,float sigma,float t,float a,float dt, int maxindex)
 {
 	int s = roundf(t/dt);
-	float result = a*f[s] + (sigma*sigma*(1-exp(-2*a*t))/(2*a)); 
+	float result = a*f[s] + (sigma*sigma*(1-expf(-2*a*t))/(2*a)); 
 
 	if(s > 0 && s < maxindex)
 		return result + (f[s+1] - f[s-1])/(2*dt);
@@ -93,7 +94,7 @@ __device__ float theta(float* f,float sigma,float t,float a,float dt, int maxind
 	return result + (f[s] - f[s-1])/(dt);
 }
 
-__glboal__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
+__global__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
 {
 	int tid = threadIdx.x + blockDim.x*blockIdx.x;
 
@@ -104,6 +105,59 @@ __glboal__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,floa
 	}
 }
 
+__global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
+{
+	// Calculate A and B to get P
+	// Simulate r, and obtain the integral (can use function of before with a minor tweak)
+	// put everything together and do reduction as usual
+	int tid = threadIdx.x;
+	extern __shared__ float sdata[];
+	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
+	float2 G = curand_normal2(&localState);
+	// convert S1 and S2 in the closest step.
+	int S1step = roundf(S1/dtstep);
+	int S2step = roundf(S2/dtstep);
+	float B = (1-expf(-a*(S2-S1)))/a;
+	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
+	float rS1;
+	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
+
+	float sintegral = 0;
+
+	// maybe not elegant but for now it will suffice
+	int X = S1/dt;
+	for(int f = 0; f <= X; f++)
+	{
+		float integral = 0;
+		float w = f*dt;
+		int N = (S1-w)/dt;
+		for(int k = 0; k <= N; k++)
+		{	
+			float i = w + k*dt;
+			int step = roundf(i/dtstep);
+			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
+		}
+		float m = rs * expf(-a*(S1)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1)))/(2*a));
+		if(f == X) rS1 = m + sigmaBig*G.x;
+		sintegral += dt/2 * (m + sigmaBig*G.x) * ((f != 0 && f != X) ? 2 : 1);
+	}
+	float P = A*expf(- B*rS1);
+	sdata[tid] = fmaxf(0.0f,expf(-sintegral)*(P-K));
+
+	for(int k = blockDim.x/2; k > 0; k /= 2)
+	{
+		if(tid < k){
+			sdata[tid] += sdata[k+tid];
+			sdata[blockDim.x + tid] += sdata[k+tid+blockDim.x];
+		}
+		__syncthreads();
+	}
+
+	if(tid == 0){
+		atomicAdd(ZBC, sdata[0]);
+	}
+}	
 
 int main(void) {
 	int n = NB * NTPB;
@@ -116,8 +170,8 @@ int main(void) {
 	float* PGPU; 
 	float* FGPU;
 
-	float* P = malloc(sizeof(float)*steps);
-	float* F = malloc(sizeof(float)*steps);
+	float* P = (float*)malloc(sizeof(float)*steps);
+	float* F = (float*)malloc(sizeof(float)*steps);
 
 	cudaMalloc(&PGPU,sizeof(float));
 	cudaMalloc(&FGPU,sizeof(float));
