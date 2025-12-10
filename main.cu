@@ -29,48 +29,38 @@ __global__ void init_curand_state_k(curandStateXORWOW_t* states)
 	curand_init(0,id,0,&states[id]);
 }
 
+__device__ float calculate_Price(float sigma, float dt,float a,float rs, float s, float t,curandStateXORWOW_t* states)
+{
+	float sintegral = 0;
+	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
+	float2 G = curand_normal2(&localState);
+
+	int X = (t-s)/dt;
+	for(int f = 0; f <= X; f++)
+	{
+		float integral = 0;
+		float w = s + f*dt;
+		int N = (t-w)/dt;
+		for(int k = 0; k <= N; k++)
+		{	
+			float i = w + k*dt;
+			integral += dt/2 * expf(-a*(t-i)) * ((i < 5) ? (0.012+0.0014*i) : (0.019+0.001*(i-5))) * ((k != 0 && k != N) ? 2 : 1);
+		}
+		float m = rs * expf(-a*(t-s)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-s)))/(2*a));
+		sintegral += dt/2 * (m + sigmaBig*G.x) * ((f != 0 && f != X) ? 2 : 1);
+	}
+	return sintegral;
+}
+
 __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,float t,curandStateXORWOW_t* states,float* Pout,float* Aout)
 {
 	extern __shared__ float sdata[];
-
-	int idx = threadIdx.x + blockIdx.x*blockDim.x;
 	int tid = threadIdx.x;
-	curandStateXORWOW_t localState = states[idx];
-	float2 G = curand_normal2(&localState);
 
-	// Calculate bond price
-
-	float integral = 0;
-	float integral_minus = 0;
-	float integral_plus = 0;
-
-	float temp;
-	int N = (t+dt-s)/dt;
-	for(int k = 0; k <= N; k++)
-	{	
-		float i = s + k*dt;
-		temp = (i < 5) ? (0.012+0.0014*i) : (0.019+0.001*(i-5));
-		if(k <= N-2)
-			integral_minus += dt/2 * expf(-a*(t-dt-i)) * temp * ((k != 0 && k != N-2) ? 2 : 1);
-		if(k <= N-1)
-			integral += dt/2 * expf(-a*(t-i)) * temp * ((k != 0 && k != N-1) ? 2 : 1);
-		integral_plus += dt/2 * expf(-a*(t+dt-i)) * temp * ((k != 0 && k != N) ? 2 : 1);
-	}
-
-	float m = rs * expf(-a*(t-s)) + integral;
-	float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-s)))/(2*a));
-	sdata[tid] = m + sigmaBig*G.x;
-	printf("%f\n",sdata[tid]);
-	m = rs * expf(-a*(t-dt-s)) + integral_minus;
-	sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-dt-s)))/(2*a));
-	temp = m + sigmaBig*G.x;
-
-	m = rs * expf(-a*(t+dt-s)) + integral_plus;
-	sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t+dt-s)))/(2*a));
-	sdata[blockDim.x+tid] = (log(m+sigmaBig*G.x) - log(temp))/(2*dt);
-
-	// Reduction on the same block
-
+	sdata[tid] = expf(-calculate_Price(sigma,dt,a,rs,s,t,states));
+	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+0.1,states) - calculate_Price(sigma,dt,a,rs,s,t-0.1,states) )/2;
+	
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
 		if(tid < k){
@@ -80,7 +70,6 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 		__syncthreads();
 	}
 
-	// Atomic add
 	if(tid == 0){
 		atomicAdd(Pout, sdata[0]);
 		atomicAdd(Aout, sdata[blockDim.x]);
@@ -92,7 +81,7 @@ int main(void) {
 	float sigma = 0.1;
 	float s = 0;
 	float t = 5.0;
-	float dt = 0.01;
+	float dt = 0.001;
 	float rzero = 0.012;
 	float a = 1.0;
 	float* PGPU; 
