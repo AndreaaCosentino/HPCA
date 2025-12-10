@@ -9,6 +9,7 @@
 
 #define NB 2048
 #define NTPB 1024
+#define T 10;
 
 // Function that catches the error 
 void testCUDA(cudaError_t error, const char* file, int line) {
@@ -76,16 +77,47 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 	}
 }
 
+// Theta functions not tested
+
+__device__ float theta(float* f,float sigma,float t,float a,float dt, int maxindex)
+{
+	int s = roundf(t/dt);
+	float result = a*f[s] + (sigma*sigma*(1-exp(-2*a*t))/(2*a)); 
+
+	if(s > 0 && s < maxindex)
+		return result + (f[s+1] - f[s-1])/(2*dt);
+	
+	if(s == 0)
+		return result + (f[s+1] - f[s])/(dt);
+	
+	return result + (f[s] - f[s-1])/(dt);
+}
+
+__glboal__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
+{
+	int tid = threadIdx.x + blockDim.x*blockIdx.x;
+
+	if(tid <= maxindex)
+	{
+		float t = tid*dt;
+		res[tid] = theta(f,sigma,t,a,dt,maxindex);
+	}
+}
+
+
 int main(void) {
 	int n = NB * NTPB;
+	int steps = 20;
 	float sigma = 0.1;
 	float s = 0;
-	float t = 5.0;
 	float dt = 0.01;
 	float rzero = 0.012;
 	float a = 1.0;
 	float* PGPU; 
 	float* FGPU;
+
+	float* P = malloc(sizeof(float)*steps);
+	float* F = malloc(sizeof(float)*steps);
 
 	cudaMalloc(&PGPU,sizeof(float));
 	cudaMalloc(&FGPU,sizeof(float));
@@ -96,13 +128,25 @@ int main(void) {
 
 	init_curand_state_k<<<NB, NTPB>>>(states);
 	cudaDeviceSynchronize();
-	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
-	cudaDeviceSynchronize();
+
 	float PCPU,FCPU;
-	cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
+	for(int i = 0; i < steps; i++)
+	{
+		float t = ((float)T)/((float)steps)*i;
+		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
+		cudaDeviceSynchronize();
+		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
+    	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
+    	P[i] = PCPU;
+    	F[i] = FCPU;
+	}
+
+	// call theta_k and get an array with its piecewise linear expression
+
+	// use it to simulate ZBC (tedious but easy)
+
 	// divide out by number of total threads
-	printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);
+	//printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);
 	
 	cudaFree(PGPU);
 	cudaFree(FGPU);
