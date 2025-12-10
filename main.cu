@@ -137,8 +137,8 @@ int main(void) {
 		cudaDeviceSynchronize();
 		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
     	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    	P[i] = PCPU;
-    	F[i] = FCPU;
+    	P[i] = PCPU/n;
+    	F[i] = FCPU/n;
 	}
 
 	// call theta_k and get an array with its piecewise linear expression
