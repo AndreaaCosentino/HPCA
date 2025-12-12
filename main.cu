@@ -35,13 +35,12 @@ __device__ float calculate_Price(float sigma, float dt,float a,float rs, float s
 {
 	float sintegral = 0;
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-
+	float2 G = curand_normal2(&localState);
 	int X = (t-s)/dt;
 	float s_temp = s;
 	float r_temp = rs;
 	for(int f = 0; f <= X; f++)
 	{
-		float2 G = curand_normal2(&localState);
 		float integral = 0;
 		float w = s + f*dt;
 		int N = (t-w)/dt;
@@ -67,7 +66,7 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 
 	sdata[tid] = expf(-calculate_Price(sigma,dt,a,rs,s,t,states));
 	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+0.1,states) - calculate_Price(sigma,dt,a,rs,s,t-0.1,states) )/(2*0.1);
-	
+	__syncthreads();
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
 		if(tid < k){
@@ -118,6 +117,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	int tid = threadIdx.x;
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
+	float2 G = curand_normal2(&localState);
 	// convert S1 and S2 in the closest step.
 	int S1step = roundf(S1/dtstep);
 	int S2step = roundf(S2/dtstep);
@@ -134,7 +134,6 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	float r_temp = rs;
 	for(int f = 0; f <= X; f++)
 	{
-		float2 G = curand_normal2(&localState);
 		float integral = 0;
 		float w = f*dt;
 		int N = (S1-w)/dt;
@@ -153,6 +152,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	}
 	float P = A*expf(- B*rS1);
 	sdata[tid] = fmaxf(0.0f,expf(-sintegral)*(P-K));
+	__syncthreads();
 
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
@@ -168,9 +168,88 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	}
 }
 
-__global__ void ZBC_derivative_k(/*PARAMETERS... I dont know yet what though*/)
+__global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 {
+	// derivative of P(S_1,S_2)
+	// we need: derivative of A and derivative of r
+	int tid = threadIdx.x;
+	extern __shared__ float sdata[];
+	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
+	float2 G = curand_normal2(&localState);
+	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
+	int S1step = roundf(S1/dtstep);
+	int S2step = roundf(S2/dtstep);
+	float B = (1-expf(-a*(S2-S1)))/a;
+	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
+	float rS1;
 
+	// calculates integral of r_s from 0 to S_1
+	int X = S1/dt;
+	float s_temp = S1;
+	float r_temp = rs;
+	float sintegral = 0;
+	for(int f = 0; f <= X; f++)
+	{
+		float integral = 0;
+		float w = f*dt;
+		int N = (S1-w)/dt;
+		for(int k = 0; k <= N; k++)
+		{	
+			float i = w + k*dt;
+			int step = roundf(i/dtstep);
+			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
+		}
+		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-s_temp)))/(2*a));
+		r_temp = m + sigmaBig*G.x;
+		s_temp = w;
+		if(f == X) rS1 = r_temp;
+		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
+	}
+	float P = A*expf(- B*rS1);
+
+	float temp_dev = 0;
+	float dev_integral = 0;
+	for(int f = 1; f <= X ; f++)
+	{
+		float w = f*dt;
+		float m = temp_dev * expf(-a*(S1-w)) + (2*sigma*expf(-a*S1)*(cosh(a*S1)-cosh(a*w)))/(a*a);
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-w)))/(2*a));
+		temp_dev = m+ sigmaBig/sigma * G.x;
+		dev_integral = dt/2*temp_dev*((f != X) ? 2 : 1);
+	}
+
+	float result = fmaxf(0.0f,dev_integral*expf(-sintegral)*(P-K));	
+
+	if(P > K)
+	{
+		// need to calculate derivative of P(S_1,S_2)
+		temp_dev = 0;
+		for(int f = 0; f <= X ; f++)
+		{
+			float w = f*dt;
+			float m = temp_dev * expf(-a*(S1-w)) + (2*sigma*expf(-a*S1)*(cosh(a*S1)-cosh(a*w)))/(a*a);
+			float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-w)))/(2*a));
+			temp_dev = m+ sigmaBig/sigma * G.x;
+		}
+		float Adev = 0;
+		Adev = A*(-(2*sigma*(1-expf(-2*a*S2)))/(4*a)*B*B);
+		float Pdev = A*expf(-B*rS1)*temp_dev + Adev*expf(-B*rS1);
+		sdata[tid] = Pdev*expf(-sintegral)-result;
+	}else{sdata[tid] = -result;}
+	__syncthreads();
+	for(int k = blockDim.x/2; k > 0; k /= 2)
+	{
+		if(tid < k){
+			sdata[tid] += sdata[k+tid];
+			sdata[blockDim.x + tid] += sdata[k+tid+blockDim.x];
+		}
+		__syncthreads();
+	}
+
+	if(tid == 0){
+		atomicAdd(ZBC, sdata[0]);
+	}
 }	
 
 int main(void) {
