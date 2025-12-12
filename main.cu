@@ -35,22 +35,27 @@ __device__ float calculate_Price(float sigma, float dt,float a,float rs, float s
 {
 	float sintegral = 0;
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float2 G = curand_normal2(&localState);
 
 	int X = (t-s)/dt;
+	float s_temp = s;
+	float r_temp = rs;
 	for(int f = 0; f <= X; f++)
 	{
+		float2 G = curand_normal2(&localState);
 		float integral = 0;
 		float w = s + f*dt;
 		int N = (t-w)/dt;
+		// implements integral term of m
 		for(int k = 0; k <= N; k++)
 		{	
 			float i = w + k*dt;
 			integral += dt/2 * expf(-a*(t-i)) * ((i < 5) ? (0.012+0.0014*i) : (0.019+0.001*(i-5))) * ((k != 0 && k != N) ? 2 : 1);
 		}
-		float m = rs * expf(-a*(t-s)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-s)))/(2*a));
-		sintegral += dt/2 * (m + sigmaBig*G.x) * ((f != 0 && f != X) ? 2 : 1);
+		float m = r_temp * expf(-a*(t-s_temp)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-s_temp)))/(2*a));
+		r_temp = m + sigmaBig*G.x;
+		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
+		s_temp = w; 
 	}
 	return sintegral;
 }
@@ -113,7 +118,6 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	int tid = threadIdx.x;
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float2 G = curand_normal2(&localState);
 	// convert S1 and S2 in the closest step.
 	int S1step = roundf(S1/dtstep);
 	int S2step = roundf(S2/dtstep);
@@ -126,8 +130,11 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 
 	// maybe not elegant but for now it will suffice
 	int X = S1/dt;
+	float s_temp = S1;
+	float r_temp = rs;
 	for(int f = 0; f <= X; f++)
 	{
+		float2 G = curand_normal2(&localState);
 		float integral = 0;
 		float w = f*dt;
 		int N = (S1-w)/dt;
@@ -137,10 +144,12 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 			int step = roundf(i/dtstep);
 			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
 		}
-		float m = rs * expf(-a*(S1)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1)))/(2*a));
-		if(f == X) rS1 = m + sigmaBig*G.x;
-		sintegral += dt/2 * (m + sigmaBig*G.x) * ((f != 0 && f != X) ? 2 : 1);
+		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-s_temp)))/(2*a));
+		r_temp = m + sigmaBig*G.x;
+		s_temp = w;
+		if(f == X) rS1 = r_temp;
+		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
 	}
 	float P = A*expf(- B*rS1);
 	sdata[tid] = fmaxf(0.0f,expf(-sintegral)*(P-K));
@@ -157,6 +166,11 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	if(tid == 0){
 		atomicAdd(ZBC, sdata[0]);
 	}
+}
+
+__global__ void ZBC_derivative_k(/*PARAMETERS... I dont know yet what though*/)
+{
+
 }	
 
 int main(void) {
@@ -184,7 +198,7 @@ int main(void) {
 	cudaDeviceSynchronize();
 
 	float PCPU,FCPU;
-	for(int i = 0; i < steps; i++)
+	/*for(int i = 0; i < steps; i++)
 	{
 		float t = ((float)T)/((float)steps)*i;
 		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
@@ -193,14 +207,18 @@ int main(void) {
     	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
     	P[i] = PCPU/n;
     	F[i] = FCPU/n;
-	}
-
+	}*/
+	float t = 5.0;
+	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
+	cudaDeviceSynchronize();
+	cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
 	// call theta_k and get an array with its piecewise linear expression
 
 	// use it to simulate ZBC (tedious but easy)
 
 	// divide out by number of total threads
-	//printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);
+	printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);
 	
 	cudaFree(PGPU);
 	cudaFree(FGPU);
