@@ -8,8 +8,8 @@
 #include <curand_kernel.h>
 #include <math.h>
 
-#define NB 2048
-#define NTPB 1024
+#define NB 1
+#define NTPB 5
 #define T 10
 
 // Function that catches the error 
@@ -88,7 +88,6 @@ __device__ float theta(float* f,float sigma,float t,float a,float dt, int maxind
 {
 	int s = roundf(t/dt);
 	float result = a*f[s] + (sigma*sigma*(1-expf(-2*a*t))/(2*a)); 
-
 	if(s > 0 && s < maxindex)
 		return result + (f[s+1] - f[s-1])/(2*dt);
 	
@@ -109,7 +108,7 @@ __global__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,floa
 	}
 }
 
-__global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
+__global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 {
 	// Calculate A and B to get P
 	// Simulate r, and obtain the integral (can use function of before with a minor tweak)
@@ -118,11 +117,12 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
 	float2 G = curand_normal2(&localState);
-	// convert S1 and S2 in the closest step.
-	int S1step = roundf(S1/dtstep);
-	int S2step = roundf(S2/dtstep);
+	// convert S1 and S2 to the closest step.
+	int S1step = roundf(S1/dt)-1;
+	int S2step = roundf(S2/dt)-1;
 	float B = (1-expf(-a*(S2-S1)))/a;
 	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
+	//printf("%d %d %f %f %f \n",S2step,S1step,p[S2step],p[S1step],f[S1step]);
 	float rS1;
 	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
 
@@ -140,7 +140,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 		for(int k = 0; k <= N; k++)
 		{	
 			float i = w + k*dt;
-			int step = roundf(i/dtstep);
+			int step = roundf(i/dt);
 			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
 		}
 		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
@@ -150,8 +150,10 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 		if(f == X) rS1 = r_temp;
 		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
 	}
-	float P = A*expf(- B*rS1);
-	sdata[tid] = fmaxf(0.0f,expf(-sintegral)*(P-K));
+	float P = A*expf(-B*rS1);
+	printf("%f %f %f %f\n",P,A,B,rS1);
+	sdata[tid] = expf(-sintegral)*fmaxf(0.0f,P-K);
+	printf("%f %f\n",sdata[tid],P-K);
 	__syncthreads();
 
 	for(int k = blockDim.x/2; k > 0; k /= 2)
@@ -254,41 +256,60 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 
 int main(void) {
 	int n = NB * NTPB;
-	int steps = 20;
+	int steps = 50;
 	float sigma = 0.1;
 	float s = 0;
-	float dt = 0.01;
+	float dt =  ((float)T)/((float)steps);
 	float rzero = 0.012;
 	float a = 1.0;
 	float* PGPU; 
 	float* FGPU;
+	float* thetaGPU;
+	float* ZBCGPU;
+	float ZBC;
 
 	float* P = (float*)malloc(sizeof(float)*steps);
 	float* F = (float*)malloc(sizeof(float)*steps);
 
 	cudaMalloc(&PGPU,sizeof(float));
 	cudaMalloc(&FGPU,sizeof(float));
+	cudaMalloc(&thetaGPU,sizeof(float)*steps);
 	cudaMemset(PGPU, 0, sizeof(float));
 	cudaMemset(FGPU, 0, sizeof(float));
 	curandStateXORWOW_t* states;
 	cudaMalloc(&states,n*sizeof(curandStateXORWOW_t));
+	cudaMalloc(&ZBCGPU,sizeof(float));
+
 
 	init_curand_state_k<<<NB, NTPB>>>(states);
 	cudaDeviceSynchronize();
 
 	float PCPU,FCPU;
-	/*for(int i = 0; i < steps; i++)
+	for(int i = 1; i <= steps; i++)
 	{
-		float t = ((float)T)/((float)steps)*i;
+		float t = dt*i;
 		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
 		cudaDeviceSynchronize();
 		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
     	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    	P[i] = PCPU/n;
-    	F[i] = FCPU/n;
-	}*/
-	float t = 5.0;
-	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
+    	P[i-1] = PCPU/n;
+    	F[i-1] = FCPU/n;
+    	cudaMemset(PGPU,0,sizeof(float));
+    	cudaMemset(FGPU,0,sizeof(float));
+	}
+	cudaMalloc(&FGPU,sizeof(float)*steps);
+	cudaMalloc(&PGPU,sizeof(float)*steps);
+	cudaMemcpy(FGPU,F,sizeof(float)*steps,cudaMemcpyHostToDevice);
+	cudaMemcpy(PGPU,P,sizeof(float)*steps,cudaMemcpyHostToDevice);
+	//theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
+	theta_k<<<1,steps>>>(FGPU,sigma,a,dt,steps,thetaGPU);
+
+	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
+	ZBC_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
+	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyHostToDevice);
+	printf("ZBC value is %f\n",ZBC);
+	/*
+	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
 	cudaDeviceSynchronize();
 	cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
@@ -297,7 +318,7 @@ int main(void) {
 	// use it to simulate ZBC (tedious but easy)
 
 	// divide out by number of total threads
-	printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);
+	printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);*/
 	
 	cudaFree(PGPU);
 	cudaFree(FGPU);
