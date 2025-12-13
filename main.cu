@@ -9,7 +9,7 @@
 #include <math.h>
 
 #define NB 1
-#define NTPB 5
+#define NTPB 15
 #define T 10
 
 // Function that catches the error 
@@ -151,16 +151,13 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
 	}
 	float P = A*expf(-B*rS1);
-	printf("%f %f %f %f\n",P,A,B,rS1);
 	sdata[tid] = expf(-sintegral)*fmaxf(0.0f,P-K);
-	printf("%f %f\n",sdata[tid],P-K);
 	__syncthreads();
 
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
 		if(tid < k){
 			sdata[tid] += sdata[k+tid];
-			sdata[blockDim.x + tid] += sdata[k+tid+blockDim.x];
 		}
 		__syncthreads();
 	}
@@ -306,8 +303,8 @@ int main(void) {
 
 	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 	ZBC_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
-	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyHostToDevice);
-	printf("ZBC value is %f\n",ZBC);
+	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
+	printf("ZBC value is %f\n",ZBC/n);
 	/*
 	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
 	cudaDeviceSynchronize();
