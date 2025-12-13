@@ -39,7 +39,7 @@ __device__ float calculate_Price(float sigma, float dt,float a,float rs, float s
 	int X = (t-s)/dt;
 	float s_temp = s;
 	float r_temp = rs;
-	for(int f = 0; f <= X; f++)
+	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
 		float w = s + f*dt;
@@ -132,7 +132,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	int X = S1/dt;
 	float s_temp = S1;
 	float r_temp = rs;
-	for(int f = 0; f <= X; f++)
+	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
 		float w = f*dt;
@@ -167,7 +167,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	}
 }
 
-__global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
+__global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 {
 	// derivative of P(S_1,S_2)
 	// we need: derivative of A and derivative of r
@@ -176,8 +176,8 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
 	float2 G = curand_normal2(&localState);
 	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
-	int S1step = roundf(S1/dtstep);
-	int S2step = roundf(S2/dtstep);
+	int S1step = roundf(S1/dt)-1;
+	int S2step = roundf(S2/dt)-1;
 	float B = (1-expf(-a*(S2-S1)))/a;
 	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
 	float rS1;
@@ -195,7 +195,7 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 		for(int k = 0; k <= N; k++)
 		{	
 			float i = w + k*dt;
-			int step = roundf(i/dtstep);
+			int step = roundf(i/dt);
 			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
 		}
 		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
@@ -214,11 +214,12 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 		float w = f*dt;
 		float m = temp_dev * expf(-a*(S1-w)) + (2*sigma*expf(-a*S1)*(cosh(a*S1)-cosh(a*w)))/(a*a);
 		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-w)))/(2*a));
-		temp_dev = m+ sigmaBig/sigma * G.x;
-		dev_integral = dt/2*temp_dev*((f != X) ? 2 : 1);
+		temp_dev = m + sigmaBig/sigma * G.x;
+		dev_integral += dt/2*temp_dev*((f != X) ? 2 : 1);
 	}
 
-	float result = fmaxf(0.0f,dev_integral*expf(-sintegral)*(P-K));	
+	float result = fmaxf(0.0f,(P-K));
+	result *= dev_integral*expf(-sintegral);	
 
 	if(P > K)
 	{
@@ -233,7 +234,7 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 		}
 		float Adev = 0;
 		Adev = A*(-(2*sigma*(1-expf(-2*a*S2)))/(4*a)*B*B);
-		float Pdev = A*expf(-B*rS1)*temp_dev + Adev*expf(-B*rS1);
+		float Pdev = A*expf(-B*rS1)*(-B)*temp_dev + Adev*expf(-B*rS1);
 		sdata[tid] = Pdev*expf(-sintegral)-result;
 	}else{sdata[tid] = -result;}
 	__syncthreads();
@@ -241,7 +242,6 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	{
 		if(tid < k){
 			sdata[tid] += sdata[k+tid];
-			sdata[blockDim.x + tid] += sdata[k+tid+blockDim.x];
 		}
 		__syncthreads();
 	}
@@ -263,7 +263,9 @@ int main(void) {
 	float* FGPU;
 	float* thetaGPU;
 	float* ZBCGPU;
+	float* ZBCGPUD;
 	float ZBC;
+	float ZBC2;
 
 	float* P = (float*)malloc(sizeof(float)*steps);
 	float* F = (float*)malloc(sizeof(float)*steps);
@@ -276,7 +278,7 @@ int main(void) {
 	curandStateXORWOW_t* states;
 	cudaMalloc(&states,n*sizeof(curandStateXORWOW_t));
 	cudaMalloc(&ZBCGPU,sizeof(float));
-
+	cudaMalloc(&ZBCGPUD,sizeof(float));
 
 	init_curand_state_k<<<NB, NTPB>>>(states);
 	cudaDeviceSynchronize();
@@ -302,9 +304,28 @@ int main(void) {
 	theta_k<<<1,steps>>>(FGPU,sigma,a,dt,steps,thetaGPU);
 
 	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
-	ZBC_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
+	/*ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
 	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
-	printf("ZBC value is %f\n",ZBC/n);
+	printf("ZBC value is %f\n",ZBC/n);*/
+
+	ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma-0.001,dt,a,rzero,states,ZBCGPU);
+	cudaDeviceSynchronize();
+	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
+	cudaMemset(ZBCGPU,0,sizeof(float));
+	init_curand_state_k<<<NB, NTPB>>>(states);
+	cudaDeviceSynchronize();
+	ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma+0.001,dt,a,rzero,states,ZBCGPU);
+	cudaDeviceSynchronize();
+	cudaMemcpy(&ZBC2,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
+	ZBC /= n;
+	ZBC2 /= n;
+	printf("Derivative with first method of ZBC is %f\n",(ZBC2-ZBC)/(2*0.001));
+	init_curand_state_k<<<NB, NTPB>>>(states);
+	cudaDeviceSynchronize();
+	ZBC_derivative_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,exp(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPUD);
+	cudaDeviceSynchronize();
+	cudaMemcpy(&ZBC,ZBCGPUD,sizeof(float),cudaMemcpyDeviceToHost);
+	printf("Derivative of ZBC is %f\n",ZBC/n);
 	/*
 	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
 	cudaDeviceSynchronize();
@@ -319,6 +340,10 @@ int main(void) {
 	
 	cudaFree(PGPU);
 	cudaFree(FGPU);
+	cudaFree(thetaGPU);
+	cudaFree(ZBCGPU);
 	cudaFree(states);
+	free(P);
+	free(F);
 	return 0;
 }
