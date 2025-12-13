@@ -33,28 +33,24 @@ __global__ void init_curand_state_k(curandStateXORWOW_t* states)
 
 __device__ float calculate_Price(float sigma, float dt,float a,float rs, float s, float t,curandStateXORWOW_t* states)
 {
-	float sintegral = 0;
+	float sintegral = dt/2*rs;
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
 	float2 G = curand_normal2(&localState);
 	int X = (t-s)/dt;
-	float s_temp = s;
 	float r_temp = rs;
 	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
 		float w = s + f*dt;
-		int N = (t-w)/dt;
 		// implements integral term of m
-		for(int k = 0; k <= N; k++)
-		{	
-			float i = w + k*dt;
-			integral += dt/2 * expf(-a*(t-i)) * ((i < 5) ? (0.012+0.0014*i) : (0.019+0.001*(i-5))) * ((k != 0 && k != N) ? 2 : 1);
-		}
-		float m = r_temp * expf(-a*(t-s_temp)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(t-s_temp)))/(2*a));
+		integral += expf(-a*(dt)) * ((w-dt < 5) ? (0.012+0.0014*(w-dt)) : (0.019+0.001*(w-dt-5)));
+		integral += 1.0f * ((w < 5) ? (0.012+0.0014*w) : (0.019+0.001*(w-5)));
+		integral *= dt/2;
+
+		float m = r_temp * expf(-a*(dt)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
 		r_temp = m + sigmaBig*G.x;
 		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
-		s_temp = w; 
 	}
 	return sintegral;
 }
@@ -126,29 +122,24 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	float rS1;
 	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
 
-	float sintegral = 0;
+	float sintegral = dt/2*rs;
 
 	// maybe not elegant but for now it will suffice
 	int X = S1/dt;
-	float s_temp = S1;
 	float r_temp = rs;
 	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
-		float w = f*dt;
-		int N = (S1-w)/dt;
-		for(int k = 0; k <= N; k++)
-		{	
-			float i = w + k*dt;
-			int step = roundf(i/dt);
-			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
-		}
-		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-s_temp)))/(2*a));
+
+		integral += expf(-a*(dt)) * theta[f-1]; 
+		integral += 1.0f * theta[f];
+		integral *= dt/2;
+
+		float m = r_temp * expf(-a*(dt)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
 		r_temp = m + sigmaBig*G.x;
-		s_temp = w;
 		if(f == X) rS1 = r_temp;
-		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
+		sintegral += dt/2 * r_temp * ((f != X) ? 2 : 1);
 	}
 	float P = A*expf(-B*rS1);
 	sdata[tid] = expf(-sintegral)*fmaxf(0.0f,P-K);
@@ -184,26 +175,21 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 
 	// calculates integral of r_s from 0 to S_1
 	int X = S1/dt;
-	float s_temp = S1;
 	float r_temp = rs;
-	float sintegral = 0;
-	for(int f = 0; f <= X; f++)
+	float sintegral = dt/2*rs;
+	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
-		float w = f*dt;
-		int N = (S1-w)/dt;
-		for(int k = 0; k <= N; k++)
-		{	
-			float i = w + k*dt;
-			int step = roundf(i/dt);
-			integral += dt/2 * expf(-a*(S1-i)) * theta[step] * ((k != 0 && k != N) ? 2 : 1);
-		}
-		float m = r_temp * expf(-a*(S1-s_temp)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-s_temp)))/(2*a));
+
+		integral += expf(-a*(dt)) * theta[f-1]; 
+		integral += 1.0f * theta[f];
+		integral *= dt/2;
+
+		float m = r_temp * expf(-a*(dt)) + integral;
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
 		r_temp = m + sigmaBig*G.x;
-		s_temp = w;
 		if(f == X) rS1 = r_temp;
-		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
+		sintegral += dt/2 * r_temp * ((f != X) ? 2 : 1);
 	}
 	float P = A*expf(- B*rS1);
 
@@ -212,8 +198,8 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	for(int f = 1; f <= X ; f++)
 	{
 		float w = f*dt;
-		float m = temp_dev * expf(-a*(S1-w)) + (2*sigma*expf(-a*S1)*(cosh(a*S1)-cosh(a*w)))/(a*a);
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-w)))/(2*a));
+		float m = temp_dev * expf(-a*(dt)) + (2*sigma*expf(-a*w)*(cosh(a*w)-cosh(a*(w-dt))))/(a*a);
+		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
 		temp_dev = m + sigmaBig/sigma * G.x;
 		dev_integral += dt/2*temp_dev*((f != X) ? 2 : 1);
 	}
@@ -223,15 +209,6 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 
 	if(P > K)
 	{
-		// need to calculate derivative of P(S_1,S_2)
-		temp_dev = 0;
-		for(int f = 0; f <= X ; f++)
-		{
-			float w = f*dt;
-			float m = temp_dev * expf(-a*(S1-w)) + (2*sigma*expf(-a*S1)*(cosh(a*S1)-cosh(a*w)))/(a*a);
-			float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(S1-w)))/(2*a));
-			temp_dev = m+ sigmaBig/sigma * G.x;
-		}
 		float Adev = 0;
 		Adev = A*(-(2*sigma*(1-expf(-2*a*S2)))/(4*a)*B*B);
 		float Pdev = A*expf(-B*rS1)*(-B)*temp_dev + Adev*expf(-B*rS1);
