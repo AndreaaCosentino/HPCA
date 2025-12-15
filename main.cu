@@ -35,18 +35,24 @@ __device__ float calculate_Price(float sigma, float dt,float a,float rs, float s
 {
 	float sintegral = dt/2*rs;
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float2 G = curand_normal2(&localState);
+	float A,B;
 	int X = (t-s)/dt;
 	float r_temp = rs;
 	for(int f = 1; f <= X; f++)
 	{
+		float2 G = curand_normal2(&localState);
 		float integral = 0;
 		float w = s + f*dt;
+		if( w < 5)
+		{	
+			A = 0.012;
+			B = 0.0014;
+		}else{
+			A = 0.019;
+			B = 0.001;
+		}
 		// implements integral term of m
-		integral += expf(-a*(dt)) * ((w-dt < 5) ? (0.012+0.0014*(w-dt)) : (0.019+0.001*(w-dt-5)));
-		integral += 1.0f * ((w < 5) ? (0.012+0.0014*w) : (0.019+0.001*(w-5)));
-		integral *= dt/2;
-
+		integral = 1/(a*a)*((a*(A+B*w)-B)-expf(-a*dt)*(a*(A+B*(w-dt)-B)));
 		float m = r_temp * expf(-a*(dt)) + integral;
 		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
 		r_temp = m + sigmaBig*G.x;
@@ -59,7 +65,6 @@ __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,floa
 {
 	extern __shared__ float sdata[];
 	int tid = threadIdx.x;
-
 	sdata[tid] = expf(-calculate_Price(sigma,dt,a,rs,s,t,states));
 	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+dt*0.5,states) - calculate_Price(sigma,dt,a,rs,s,t-dt*0.5,states) )/(2*dt*0.5);
 	__syncthreads();
@@ -112,7 +117,6 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	int tid = threadIdx.x;
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float2 G = curand_normal2(&localState);
 	// convert S1 and S2 to the closest step.
 	int S1step = roundf(S1/dt)-1;
 	int S2step = roundf(S2/dt)-1;
@@ -130,7 +134,7 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	for(int f = 1; f <= X; f++)
 	{
 		float integral = 0;
-
+		float2 G = curand_normal2(&localState);
 		integral += expf(-a*(dt)) * theta[f-1]; 
 		integral += 1.0f * theta[f];
 		integral *= dt/2;
@@ -165,7 +169,6 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	int tid = threadIdx.x;
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float2 G = curand_normal2(&localState);
 	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
 	int S1step = roundf(S1/dt)-1;
 	int S2step = roundf(S2/dt)-1;
@@ -176,9 +179,12 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	// calculates integral of r_s from 0 to S_1
 	int X = S1/dt;
 	float r_temp = rs;
+	float temp_dev = 0;
+	float dev_integral = 0;
 	float sintegral = dt/2*rs;
 	for(int f = 1; f <= X; f++)
 	{
+		float2 G = curand_normal2(&localState);
 		float integral = 0;
 
 		integral += expf(-a*(dt)) * theta[f-1]; 
@@ -190,19 +196,14 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 		r_temp = m + sigmaBig*G.x;
 		if(f == X) rS1 = r_temp;
 		sintegral += dt/2 * r_temp * ((f != X) ? 2 : 1);
+
+		float w = f*dt;
+		float m_dev = temp_dev * expf(-a*(dt)) + (2*sigma*expf(-a*w)*(cosh(a*w)-cosh(a*(w-dt))))/(a*a);
+		temp_dev = m_dev + sigmaBig/sigma * G.x;
+		dev_integral += dt/2*temp_dev*((f != X) ? 2 : 1);
 	}
 	float P = A*expf(- B*rS1);
 
-	float temp_dev = 0;
-	float dev_integral = 0;
-	for(int f = 1; f <= X ; f++)
-	{
-		float w = f*dt;
-		float m = temp_dev * expf(-a*(dt)) + (2*sigma*expf(-a*w)*(cosh(a*w)-cosh(a*(w-dt))))/(a*a);
-		float sigmaBig = sqrtf(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
-		temp_dev = m + sigmaBig/sigma * G.x;
-		dev_integral += dt/2*temp_dev*((f != X) ? 2 : 1);
-	}
 
 	float result = fmaxf(0.0f,(P-K));
 	result *= dev_integral*expf(-sintegral);	
@@ -279,6 +280,7 @@ int main(void) {
 	cudaMalloc(&PGPU,sizeof(float)*steps);
 	cudaMemcpy(FGPU,F,sizeof(float)*steps,cudaMemcpyHostToDevice);
 	cudaMemcpy(PGPU,P,sizeof(float)*steps,cudaMemcpyHostToDevice);
+
 	//theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
 	//theta_k<<<1,steps>>>(FGPU,sigma,a,dt,steps,thetaGPU);
 
@@ -303,8 +305,13 @@ int main(void) {
 	cudaDeviceSynchronize();
 	cudaMemcpy(&ZBC,ZBCGPUD,sizeof(float),cudaMemcpyDeviceToHost);
 	printf("Derivative of ZBC is %f\n",ZBC/n);
-	/*
-	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
+
+/*	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
+	cudaError_t err = cudaGetLastError();
+	if (err != cudaSuccess) {
+    	printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
+	}
+
 	cudaDeviceSynchronize();
 	cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
     cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
