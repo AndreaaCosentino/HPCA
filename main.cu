@@ -12,7 +12,7 @@
 #define NTPB 1024
 #define T 10
 
-// Function that catches the error 
+// Helper for catching errors
 void testCUDA(cudaError_t error, const char* file, int line) {
 
 	if (error != cudaSuccess) {
@@ -31,42 +31,70 @@ __global__ void init_curand_state_k(curandStateXORWOW_t* states)
 	curand_init(0,id,0,&states[id]);
 }
 
-__device__ float calculate_Price(float sigma, float dt,float a,float rs, float s, float t,curandStateXORWOW_t* states)
+__device__ float calculate_price(float param_sigma, float param_a, float starting_r, float starting_time, float target_time, float time_delta, curandStateXORWOW_t* states)
 {
-	float sintegral = dt/2*rs;
-	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
-	float A,B;
-	int X = (t-s)/dt;
-	float r_temp = rs;
-	for(int f = 1; f <= X; f++)
+	curandStateXORWOW_t *localState = &states[threadIdx.x + blockIdx.x * blockDim.x];
+
+	int total_steps = (target_time - starting_time) / time_delta;
+	float noise_sensitivity = sqrt(param_sigma * param_sigma * (1 - expf(-2 * param_a * time_delta)) / (2 * param_a));
+
+	float integral = 0;
+	float r_step = starting_r;
+
+	for(int step = 1; step <= total_steps; step++)
 	{
-		float2 G = curand_normal2(&localState);
-		float integral = 0;
-		float w = s + f*dt;
-		if( w < 5)
-		{	
-			A = 0.012;
-			B = 0.0014;
-		}else{
-			A = 0.019;
-			B = 0.001;
+		float r_prev_step = r_step;
+
+		float step_time = starting_time + step * time_delta;
+
+		// Computing the mean
+		float m = 0;
+		{
+			// First term of the mean
+			m += r_step * expf(-param_a * time_delta);
+
+			// Second term of the mean (formula for the integral)
+			// TODO : this is incorrect. All four values 0.012, 0.0014, 0.019 and 0.001 should be involved when the bounds are around 5.
+			// TODO : we should split this into two functions : one for the first term of theta and one of the second term of theta
+			// TODO : then use on or the other, or sum both when the bounds are around 5.
+			float A, B;
+			if(step_time < 5)
+			{
+				A = 0.012;
+				B = 0.0014;
+			}
+			else {
+				A = 0.019;
+				B = 0.001;
+			}
+			m +=
+				(
+					param_a * (A + B * step_time) - B
+					- expf(-param_a * time_delta) * (param_a * (A + B * (step_time - time_delta) - B))
+				) / (param_a * param_a);
 		}
-		// implements integral term of m
-		integral = 1/(a*a)*((a*(A+B*w)-B)-expf(-a*dt)*(a*(A+B*(w-dt)-B)));
-		float m = r_temp * expf(-a*(dt)) + integral;
-		float sigmaBig = sqrt(sigma*sigma*(1-expf(-2*a*(dt)))/(2*a));
-		r_temp = m + sigmaBig*G.x;
-		sintegral += dt/2 * r_temp * ((f != 0 && f != X) ? 2 : 1);
+
+		// Computing the noise
+		float noise = 0;
+		{
+			float random = curand_normal(localState);
+			noise = noise_sensitivity * random;
+		}
+
+		r_step = m + noise;
+
+		integral += 0.5f * (r_prev_step + r_step) * time_delta;
 	}
-	return sintegral;
+
+	return integral;
 }
 
 __global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,float t,curandStateXORWOW_t* states,float* Pout,float* Aout)
 {
 	extern __shared__ float sdata[];
 	int tid = threadIdx.x;
-	sdata[tid] = expf(-calculate_Price(sigma,dt,a,rs,s,t,states));
-	sdata[blockDim.x+tid] =  (calculate_Price(sigma,dt,a,rs,s,t+dt*0.5,states) - calculate_Price(sigma,dt,a,rs,s,t-dt*0.5,states) )/(2*dt*0.5);
+	sdata[tid] = expf(-calculate_price(sigma,a,rs,s,t,dt,states));
+	sdata[blockDim.x+tid] =  (calculate_price(sigma,a,rs,s,t+dt*0.5,dt,states) - calculate_price(sigma,a,rs,s,t-dt*0.5,dt,states) )/(2*dt*0.5);
 	__syncthreads();
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
