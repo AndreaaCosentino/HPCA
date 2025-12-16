@@ -114,25 +114,26 @@ __global__ void tree_sum(CallableValue val, float *out) {
 
 // Theta functions not tested
 
-__device__ float theta(float *f, float sigma, float t, float a, float dt, int maxindex) {
-	int s = roundf(t / dt);
-	float result = a * f[s] + sigma * sigma * (1 - expf(-2 * a * t)) / (2 * a);
-	if (s > 0 && s < maxindex)
-		return result + (f[s + 1] - f[s - 1]) / (2 * dt);
+__device__ float theta(float param_sigma, float param_a, float *f, int f_length, float T, float delta_T) {
+	int s = roundf(T / delta_T);
+	float result = param_a * f[s] + param_sigma * param_sigma * (1 - expf(-2 * param_a * T)) / (2 * param_a);
 
+	if (s > 0 && s < f_length - 1)
+		return result + (f[s + 1] - f[s - 1]) / (2 * delta_T);
 	if (s == 0)
-		return result + (f[s + 1] - f[s]) / dt;
-	if (s == maxindex)
-		return result + (f[s] - f[s - 1]) / dt;
+		return result + (f[s + 1] - f[s]) / delta_T;
+	if (s == f_length - 1)
+		return result + (f[s] - f[s - 1]) / delta_T;
+
 	return -1;
 }
 
-__global__ void theta_k(float *f, float sigma, float a, float dt, int maxindex, float *res) {
+__global__ void theta_k(float param_sigma, float param_a, float *f, int f_length, float delta_T, float *out) {
 	int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
-	if (tid <= maxindex) {
-		float t = tid * dt;
-		res[tid] = theta(f, sigma, t, a, dt, maxindex);
+	if (tid < f_length) {
+		float T = tid * delta_T;
+		out[tid] = theta(param_sigma, param_a, f, f_length, T, delta_T);
 	}
 }
 
@@ -288,27 +289,29 @@ int main() {
 
 		float avg = *sum / (NB * NTPB);
 
-		//std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
+		// std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
 
 		// f(0, T)
 		if (i != 0) {
 			float delta = logf(avg) - logf(avg_prev);
 			f[i] = -(delta / delta_T);
-			//std::cout << "f(0, " << T_i << ") = " << F[i] << std::endl;
+			// std::cout << "f(0, " << T_i << ") = " << F[i] << std::endl;
 		}
 
 		avg_prev = avg;
 	}
 
-	//Question 2.1
+	// Question 2.a :
 	float *theta;
 	cudaMallocManaged(&theta, steps * sizeof(float));
 
-	theta_k<<<1, steps>>>(f, param_sigma, param_a, delta_T, steps - 1, theta);
+	theta_k<<<1, steps>>>(param_sigma, param_a, f, steps, delta_T, theta);
 	cudaDeviceSynchronize();
 
-	for (int i = 0; i <= steps; i++)
-		printf("%f %f \n", T_start + delta_T * i, theta[i]);
+	for (int i = 0; i < steps; ++i) {
+		float T_i = T_start + delta_T * i;
+		std::cout << "theta(" << T_i << ") = " << theta[i] << std::endl;
+	}
 
 	cudaFree(sum);
 	cudaFree(states);
@@ -378,7 +381,7 @@ int main_old() {
 	cudaMalloc(&PGPU, sizeof(float) * num_el);
 	cudaMemcpy(FGPU, F, sizeof(float) * num_el, cudaMemcpyHostToDevice);
 	cudaMemcpy(PGPU, P, sizeof(float) * num_el, cudaMemcpyHostToDevice);
-	theta_k<<<1,num_el>>>(FGPU, sigma, a, dt, steps, thetaGPU);
+	theta_k<<<1,num_el>>>(sigma, a, FGPU, steps, dt, thetaGPU);
 
 	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 	/*ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
