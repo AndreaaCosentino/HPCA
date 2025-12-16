@@ -10,9 +10,8 @@
 
 #define NB 1024
 #define NTPB 1024
-#define T 10
 
-// Helper for catching errors
+/// Helper for catching errors
 void testCUDA(cudaError_t error, const char* file, int line) {
 
 	if (error != cudaSuccess) {
@@ -33,7 +32,7 @@ __global__ void init_curand_state_k(curandStateXORWOW_t* states)
 
 __device__ float calculate_price(float param_sigma, float param_a, float starting_r, float starting_time, float target_time, float time_delta, curandStateXORWOW_t* states)
 {
-	curandStateXORWOW_t *localState = &states[threadIdx.x + blockIdx.x * blockDim.x];
+	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
 
 	int total_steps = (target_time - starting_time) / time_delta;
 	float noise_sensitivity = sqrt(param_sigma * param_sigma * (1 - expf(-2 * param_a * time_delta)) / (2 * param_a));
@@ -46,38 +45,43 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 		float r_prev_step = r_step;
 
 		float step_time = starting_time + step * time_delta;
-
+		float previous_step_time = step_time - time_delta;
 		// Computing the mean
 		float m = 0;
 		{
 			// First term of the mean
 			m += r_step * expf(-param_a * time_delta);
 
-			// Second term of the mean (formula for the integral)
-			// TODO : this is incorrect. All four values 0.012, 0.0014, 0.019 and 0.001 should be involved when the bounds are around 5.
-			// TODO : we should split this into two functions : one for the first term of theta and one of the second term of theta
-			// TODO : then use on or the other, or sum both when the bounds are around 5.
 			float A, B;
-			if(step_time < 5)
-			{
+			// Second term of the mean (formula for the integral)
+			if( step_time < 5  || previous_step_time >= 5)
+			{	
+				A = (step_time < 5) ? 0.012 : 0.019;
+				B = (step_time < 5) ? 0.0014 : 0.001;
+				step_time = (step_time < 5) ? step_time : step_time-5;
+				m += 
+					(
+						param_a * (A + B * step_time) - B
+						- expf(-param_a * time_delta) * (param_a * (A + B * (step_time - time_delta) - B))
+					) / (param_a * param_a);
+			}else{
+				float d_1 = 5-previous_step_time;
+				float d_2 = step_time-5;
 				A = 0.012;
 				B = 0.0014;
-			}
-			else {
+				m += 1/(param_a*param_a)*((param_a*(A+B*5)-B)-expf(-param_a*d_1)*(param_a*(A+B*(previous_step_time))-B))*expf(-param_a * d_2);
+
 				A = 0.019;
 				B = 0.001;
+				// in this case w-dt = 0, so B*0 = 0
+				m += 1/(param_a*param_a)*((param_a*(A+B*d_2)-B)-expf(-param_a*d_2)*(param_a*A-B));
 			}
-			m +=
-				(
-					param_a * (A + B * step_time) - B
-					- expf(-param_a * time_delta) * (param_a * (A + B * (step_time - time_delta) - B))
-				) / (param_a * param_a);
 		}
 
 		// Computing the noise
 		float noise = 0;
 		{
-			float random = curand_normal(localState);
+			float random = curand_normal(&localState);
 			noise = noise_sensitivity * random;
 		}
 
@@ -86,28 +90,25 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 		integral += 0.5f * (r_prev_step + r_step) * time_delta;
 	}
 
-	return integral;
+	return expf(-integral);
 }
 
-__global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,float t,curandStateXORWOW_t* states,float* Pout,float* Aout)
+__global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,float t,curandStateXORWOW_t* states,float* Pout)
 {
 	extern __shared__ float sdata[];
 	int tid = threadIdx.x;
-	sdata[tid] = expf(-calculate_price(sigma,a,rs,s,t,dt,states));
-	sdata[blockDim.x+tid] =  (calculate_price(sigma,a,rs,s,t+dt*0.5,dt,states) - calculate_price(sigma,a,rs,s,t-dt*0.5,dt,states) )/(2*dt*0.5);
+	sdata[tid] = calculate_price(sigma,a,rs,s,t,dt,states);
 	__syncthreads();
 	for(int k = blockDim.x/2; k > 0; k /= 2)
 	{
 		if(tid < k){
 			sdata[tid] += sdata[k+tid];
-			sdata[blockDim.x + tid] += sdata[k+tid+blockDim.x];
 		}
 		__syncthreads();
 	}
 
 	if(tid == 0){
 		atomicAdd(Pout, sdata[0]);
-		atomicAdd(Aout, sdata[blockDim.x]);
 	}
 }
 
@@ -122,8 +123,9 @@ __device__ float theta(float* f,float sigma,float t,float a,float dt, int maxind
 	
 	if(s == 0)
 		return result + (f[s+1] - f[s])/(dt);
-	
-	return result + (f[s] - f[s-1])/(dt);
+	if(s == maxindex)
+		return result + (f[s] - f[s-1])/(dt);
+	return -1;
 }
 
 __global__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
@@ -134,6 +136,7 @@ __global__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,floa
 	{
 		float t = tid*dt;
 		res[tid] = theta(f,sigma,t,a,dt,maxindex);
+		printf("%f %f \n",t,res[tid]);
 	}
 }
 
@@ -146,8 +149,8 @@ __global__ void ZBC_k(float S1,float S2,float K,float* f,float* p,float* theta,f
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
 	// convert S1 and S2 to the closest step.
-	int S1step = roundf(S1/dt)-1;
-	int S2step = roundf(S2/dt)-1;
+	int S1step = roundf(S1/dt);
+	int S2step = roundf(S2/dt);
 	float B = (1-expf(-a*(S2-S1)))/a;
 	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
 	//printf("%d %d %f %f %f \n",S2step,S1step,p[S2step],p[S1step],f[S1step]);
@@ -198,8 +201,8 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x*blockDim.x];
 	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
-	int S1step = roundf(S1/dt)-1;
-	int S2step = roundf(S2/dt)-1;
+	int S1step = roundf(S1/dt);
+	int S2step = roundf(S2/dt);
 	float B = (1-expf(-a*(S2-S1)))/a;
 	float A = p[S2step]/p[S1step] * expf( B * f[S1step] - (sigma*sigma *(1-expf(-2*a*S2)))/(4*a) * B * B);
 	float rS1;
@@ -259,9 +262,10 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 
 int main(void) {
 	int n = NB * NTPB;
-	int steps = 50;
+	int steps = 30;
 	float sigma = 0.1;
 	float s = 0;
+	float T = 10;
 	float dt =  ((float)T)/((float)steps);
 	float rzero = 0.012;
 	float a = 1.0;
@@ -272,15 +276,13 @@ int main(void) {
 	float* ZBCGPUD;
 	float ZBC;
 	float ZBC2;
-
-	float* P = (float*)malloc(sizeof(float)*steps);
-	float* F = (float*)malloc(sizeof(float)*steps);
+	int num_el = steps + 1;
+	float* P = (float*)malloc(sizeof(float)*num_el);
+	float* F = (float*)malloc(sizeof(float)*num_el);
 
 	cudaMalloc(&PGPU,sizeof(float));
-	cudaMalloc(&FGPU,sizeof(float));
-	cudaMalloc(&thetaGPU,sizeof(float)*steps);
+	cudaMalloc(&thetaGPU,sizeof(float)*num_el);
 	cudaMemset(PGPU, 0, sizeof(float));
-	cudaMemset(FGPU, 0, sizeof(float));
 	curandStateXORWOW_t* states;
 	cudaMalloc(&states,n*sizeof(curandStateXORWOW_t));
 	cudaMalloc(&ZBCGPU,sizeof(float));
@@ -292,31 +294,32 @@ int main(void) {
 	cudaDeviceSynchronize();
 
 	float PCPU,FCPU;
+	P[0] = 1;
+	F[0] = rzero;
 	for(int i = 1; i <= steps; i++)
 	{
 		float t = dt*i;
-		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU,FGPU);
+		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU);
 		cudaDeviceSynchronize();
 		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    	P[i-1] = PCPU/n;
-    	F[i-1] = FCPU/n;
+    	P[i] = PCPU/n;
     	cudaMemset(PGPU,0,sizeof(float));
-    	cudaMemset(FGPU,0,sizeof(float));
 	}
-	cudaMalloc(&FGPU,sizeof(float)*steps);
-	cudaMalloc(&PGPU,sizeof(float)*steps);
-	cudaMemcpy(FGPU,F,sizeof(float)*steps,cudaMemcpyHostToDevice);
-	cudaMemcpy(PGPU,P,sizeof(float)*steps,cudaMemcpyHostToDevice);
-
-	//theta_k(float* f,float sigma,float a,float dt, int maxindex,float* res)
-	//theta_k<<<1,steps>>>(FGPU,sigma,a,dt,steps,thetaGPU);
+	for(int i = 1; i <= num_el; i++) 
+	{
+    	F[i] = -(logf(P[i]) - logf(P[i-1]))/dt;
+	}
+	cudaMalloc(&FGPU,sizeof(float)*num_el);
+	cudaMalloc(&PGPU,sizeof(float)*num_el);
+	cudaMemcpy(FGPU,F,sizeof(float)*num_el,cudaMemcpyHostToDevice);
+	cudaMemcpy(PGPU,P,sizeof(float)*num_el,cudaMemcpyHostToDevice);
+	theta_k<<<1,num_el>>>(FGPU,sigma,a,dt,steps,thetaGPU);
 
 	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
 	/*ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
 	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
 	printf("ZBC value is %f\n",ZBC/n);*/
-	theta_k<<<1,steps>>>(FGPU,sigma-0.0001,a,dt,steps,thetaGPU);
+	/*theta_k<<<1,steps>>>(FGPU,sigma-0.0001,a,dt,steps,thetaGPU);
 	ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma-0.0001,dt,a,rzero,states,ZBCGPU);
 	cudaDeviceSynchronize();
 	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
@@ -332,21 +335,23 @@ int main(void) {
 	ZBC_derivative_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPUD);
 	cudaDeviceSynchronize();
 	cudaMemcpy(&ZBC,ZBCGPUD,sizeof(float),cudaMemcpyDeviceToHost);
-	printf("Derivative of ZBC is %f\n",ZBC/n);
+	printf("Derivative of ZBC is %f\n",ZBC/n);*/
+	/*float i = T;
+	while(i <= 10)
+	{
+		dt =  ((float)i)/((float)steps);
+		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,i,states,PGPU,FGPU);
 
-/*	Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,T,states,PGPU,FGPU);
-	cudaError_t err = cudaGetLastError();
-	if (err != cudaSuccess) {
-    	printf("Kernel launch failed: %s\n", cudaGetErrorString(err));
-	}
+		cudaDeviceSynchronize();
+		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
+    	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
 
-	cudaDeviceSynchronize();
-	cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
-
-	// divide out by number of total threads
-	printf("The zero coupon bond price is %f\nThe forward rate is %f\n", PCPU/n,FCPU/n);*/
-	
+		// divide out by number of total threads
+		printf("round %f %f %f\n",i,PCPU/n,FCPU/n);
+		cudaMemset(PGPU,0,sizeof(float));
+		cudaMemset(FGPU,0,sizeof(float));
+		i += 0.5;
+	}*/
 	cudaFree(PGPU);
 	cudaFree(FGPU);
 	cudaFree(thetaGPU);
