@@ -96,8 +96,11 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 
 template<typename CallableValue>
 __global__ void tree_sum(CallableValue val, float *out) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) *out = 0;
+
 	extern __shared__ float block_data[];
 	block_data[threadIdx.x] = val();
+
 	__syncthreads();
 
 	for (int k = blockDim.x / 2; k > 0; k /= 2) {
@@ -258,9 +261,58 @@ __global__ void ZBC_derivative_k(float S1,float S2,float K,float* f,float* p,flo
 	if(tid == 0){
 		atomicAdd(ZBC, sdata[0]);
 	}
-}	
+}
 
-int main(void) {
+int main() {
+	// Question 1 :
+	int steps = 30;
+
+	float param_sigma = 0.1;
+	float param_a = 1.0;
+	float T_start = 1.0f / 3;
+	float T_end = 10;
+	float delta_T = (T_end - T_start) / (steps - 1);
+
+	curandStateXORWOW_t* states;
+	cudaMalloc(&states,NB * NTPB * sizeof(curandStateXORWOW_t));
+	init_curand_state_k<<<NB, NTPB>>>(states);
+	cudaDeviceSynchronize();
+
+	float *sum;
+	cudaMallocManaged(&sum, sizeof(float));
+
+	float avg_prev;
+
+	for (int i = 0; i < steps; ++i) {
+		float T_i = T_start + delta_T * i;
+
+		// P(0, T)
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, T_i, states] __device__ {
+			return calculate_price(param_sigma, param_a, 0.012, 0, T_i, 0.01, states);
+		}, sum);
+		cudaDeviceSynchronize();
+
+		float avg = *sum / (NB * NTPB);
+
+		std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
+
+		// f(0, T)
+		if (i != 0) {
+			float delta = logf(avg) - logf(avg_prev);
+
+			std::cout << "f(0, " << T_i << ") = " << (delta / delta_T) << std::endl;
+		}
+
+		avg_prev = avg;
+	}
+
+	cudaFree(sum);
+	cudaFree(states);
+
+	return 0;
+}
+
+int main_old() {
 	int n = NB * NTPB;
 	int steps = 30;
 	float sigma = 0.1;
@@ -299,14 +351,17 @@ int main(void) {
 	for(int i = 1; i <= steps; i++)
 	{
 		float t = dt*i;
+		std::cout << sigma << " " << a << " " << rzero << " " << s << " " << t << " " << dt << std::endl;
 		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([sigma, a, rzero, s, t, dt, states] __device__ {
-			return calculate_price(sigma,a,rzero,s,t,dt, states);
+			return calculate_price(sigma, a,rzero,s,t,dt, states);
 		}, PGPU);
 		//Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU);
 		cudaDeviceSynchronize();
 		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
+
+		std::cout << "sum : " << PCPU << std::endl;
     	P[i] = PCPU/n;
-		std::cout << i << " : " << P[i] << std::endl;
+		std::cout << i << " : " << t << ", " << P[i] << std::endl;
 
     	cudaMemset(PGPU,0,sizeof(float));
 	}
