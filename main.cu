@@ -312,15 +312,15 @@ int main() {
 	}
 
 	//Question 2.1
-	theta_k<<<1,steps>>>(F,param_sigma,param_a,delta_T,steps-1,thetaGPU);
+	theta_k<<<1,steps>>>(F,param_sigma,param_a,delta_T,steps-1,theta);
 	cudaDeviceSynchronize();
 	for(int i = 0; i <= steps; i++)
-		printf("%f %f \n",T_start+delta_T*i,thetaGPU[i]);
+		printf("%f %f \n",T_start+delta_T*i,theta[i]);
 
 	cudaFree(sum);
 	cudaFree(states);
 	cudaFree(F);
-	cudaFree(thetaGPU);
+	cudaFree(theta);
 
 	return 0;
 }
