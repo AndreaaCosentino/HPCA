@@ -9,7 +9,7 @@
 #include <iostream>
 #include <math.h>
 
-#define NB 1024
+#define NB 10000
 #define NTPB 1024
 
 /// Helper for catching errors
@@ -96,7 +96,7 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 
 template<typename CallableValue>
 __global__ void tree_sum(CallableValue val, float *out) {
-	if (threadIdx.x == 0 && blockIdx.x == 0) *out = 0;
+	//if (threadIdx.x == 0 && blockIdx.x == 0) *out = 0;
 
 	extern __shared__ float block_data[];
 	block_data[threadIdx.x] = val();
@@ -139,7 +139,6 @@ __global__ void theta_k(float* f,float sigma,float a,float dt, int maxindex,floa
 	{
 		float t = tid*dt;
 		res[tid] = theta(f,sigma,t,a,dt,maxindex);
-		printf("%f %f \n",t,res[tid]);
 	}
 }
 
@@ -269,22 +268,28 @@ int main() {
 
 	float param_sigma = 0.1;
 	float param_a = 1.0;
-	float T_start = 1.0f / 3;
+	float T_start = 0; 
 	float T_end = 10;
 	float delta_T = (T_end - T_start) / (steps - 1);
 
 	curandStateXORWOW_t* states;
+
 	cudaMalloc(&states,NB * NTPB * sizeof(curandStateXORWOW_t));
 	init_curand_state_k<<<NB, NTPB>>>(states);
 	cudaDeviceSynchronize();
+
+	float *F,*theta;
+	cudaMallocManaged(&F, steps*sizeof(float));
+	cudaMallocManaged(&theta, steps*sizeof(float));
 
 	float *sum;
 	cudaMallocManaged(&sum, sizeof(float));
 
 	float avg_prev;
-
+	F[0] = 0.012;
 	for (int i = 0; i < steps; ++i) {
 		float T_i = T_start + delta_T * i;
+		*sum = 0.0f;
 
 		// P(0, T)
 		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, T_i, states] __device__ {
@@ -294,20 +299,28 @@ int main() {
 
 		float avg = *sum / (NB * NTPB);
 
-		std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
+		//std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
 
 		// f(0, T)
 		if (i != 0) {
 			float delta = logf(avg) - logf(avg_prev);
-
-			std::cout << "f(0, " << T_i << ") = " << (delta / delta_T) << std::endl;
+			F[i] = -(delta / delta_T);
+			//std::cout << "f(0, " << T_i << ") = " << F[i] << std::endl;
 		}
 
 		avg_prev = avg;
 	}
 
+	//Question 2.1
+	theta_k<<<1,steps>>>(F,param_sigma,param_a,delta_T,steps-1,thetaGPU);
+	cudaDeviceSynchronize();
+	for(int i = 0; i <= steps; i++)
+		printf("%f %f \n",T_start+delta_T*i,thetaGPU[i]);
+
 	cudaFree(sum);
 	cudaFree(states);
+	cudaFree(F);
+	cudaFree(thetaGPU);
 
 	return 0;
 }

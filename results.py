@@ -25,7 +25,7 @@ plt.show()
 """
 
 df = pd.read_csv(
-    "theta_values.txt", 
+    "theta_values2.txt", 
     sep=r'\s+',      
     header=None,       
     names=["t","theta","theta_2"],
