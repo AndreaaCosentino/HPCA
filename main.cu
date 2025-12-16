@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <curand_kernel.h>
+#include <iostream>
 #include <math.h>
 
 #define NB 1024
@@ -54,7 +55,7 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 
 			float A, B;
 			// Second term of the mean (formula for the integral)
-			if( step_time < 5  || previous_step_time >= 5)
+			if (step_time < 5 || previous_step_time >= 5)
 			{	
 				A = (step_time < 5) ? 0.012 : 0.019;
 				B = (step_time < 5) ? 0.0014 : 0.001;
@@ -69,12 +70,12 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 				float d_2 = step_time-5;
 				A = 0.012;
 				B = 0.0014;
-				m += 1/(param_a*param_a)*((param_a*(A+B*5)-B)-expf(-param_a*d_1)*(param_a*(A+B*(previous_step_time))-B))*expf(-param_a * d_2);
+				m += 1 / (param_a * param_a) * (param_a * (A + B * 5) - B - expf(-param_a * d_1) * (param_a * (A + B * previous_step_time) - B)) * expf(-param_a * d_2);
 
 				A = 0.019;
 				B = 0.001;
 				// in this case w-dt = 0, so B*0 = 0
-				m += 1/(param_a*param_a)*((param_a*(A+B*d_2)-B)-expf(-param_a*d_2)*(param_a*A-B));
+				m += 1 / (param_a * param_a) * (param_a * (A + B * d_2) - B - expf(-param_a * d_2) * (param_a * A - B));
 			}
 		}
 
@@ -93,22 +94,21 @@ __device__ float calculate_price(float param_sigma, float param_a, float startin
 	return expf(-integral);
 }
 
-__global__ void Bond_Price_k(float sigma,float dt, float a,float rs,float s,float t,curandStateXORWOW_t* states,float* Pout)
-{
-	extern __shared__ float sdata[];
-	int tid = threadIdx.x;
-	sdata[tid] = calculate_price(sigma,a,rs,s,t,dt,states);
+template<typename CallableValue>
+__global__ void tree_sum(CallableValue val, float *out) {
+	extern __shared__ float block_data[];
+	block_data[threadIdx.x] = val();
 	__syncthreads();
-	for(int k = blockDim.x/2; k > 0; k /= 2)
-	{
-		if(tid < k){
-			sdata[tid] += sdata[k+tid];
-		}
+
+	for (int k = blockDim.x / 2; k > 0; k /= 2) {
+		if (threadIdx.x < k)
+			block_data[threadIdx.x] += block_data[threadIdx.x + k];
+
 		__syncthreads();
 	}
 
-	if(tid == 0){
-		atomicAdd(Pout, sdata[0]);
+	if (threadIdx.x == 0) {
+		atomicAdd(out, block_data[0]);
 	}
 }
 
@@ -299,12 +299,18 @@ int main(void) {
 	for(int i = 1; i <= steps; i++)
 	{
 		float t = dt*i;
-		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU);
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([sigma, a, rzero, s, t, dt, states] __device__ {
+			return calculate_price(sigma,a,rzero,s,t,dt, states);
+		}, PGPU);
+		//Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU);
 		cudaDeviceSynchronize();
 		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
     	P[i] = PCPU/n;
+		std::cout << i << " : " << P[i] << std::endl;
+
     	cudaMemset(PGPU,0,sizeof(float));
 	}
+
 	for(int i = 1; i <= num_el; i++) 
 	{
     	F[i] = -(logf(P[i]) - logf(P[i-1]))/dt;
