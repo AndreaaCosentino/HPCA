@@ -9,7 +9,7 @@
 #include <iostream>
 #include <math.h>
 
-#define NB 10000
+#define NB 1024
 #define NTPB 1024
 
 /// Helper for catching errors
@@ -137,48 +137,53 @@ __global__ void theta_k(float param_sigma, float param_a, float *f, int f_length
 	}
 }
 
+
 __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float S2, float K, float *P, float *f, float *theta,
 					 float starting_r, float time_delta, curandStateXORWOW_t *states) {
-	// Calculate A and B to get P
-	// Simulate r, and obtain the integral (can use function of before with a minor tweak)
-	// put everything together and do reduction as usual
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
+	float noise_sensitivity = sqrt(param_sigma * param_sigma * (1 - expf(-2 * param_a * time_delta)) / (2 * param_a));
 	// convert S1 and S2 to the closest step.
 	int S1step = roundf(S1 / time_delta);
 	int S2step = roundf(S2 / time_delta);
+	// Values A(S1,S2) and B(S1,S2)
 	float B = (1 - expf(-param_a * (S2 - S1))) / param_a;
 	float A = P[S2step] / P[S1step] * expf(B * f[S1step] - (param_sigma * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
-	//printf("%d %d %f %f %f \n",S2step,S1step,P[S2step],P[S1step],f[S1step]);
-	float rS1;
-	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
 
-	float sintegral = time_delta / 2 * starting_r;
+	float integral = 0;
 
-	// maybe not elegant but for now it will suffice
 	int X = S1 / time_delta;
-	float r_temp = starting_r;
+	float r_step = starting_r;
 	for (int n = 1; n <= X; n++) {
-		float integral = 0;
-		float2 G = curand_normal2(&localState);
-		integral += expf(-param_a * (time_delta)) * theta[n - 1];
-		integral += 1.0f * theta[n];
-		integral *= time_delta / 2;
+		float r_prev_step = r_step;
 
-		float m = r_temp * expf(-param_a * (time_delta)) + integral;
-		float sigmaBig = sqrtf(param_sigma * param_sigma * (1 - expf(-2 * param_a * (time_delta))) / (2 * param_a));
-		r_temp = m + sigmaBig * G.x;
-		if (n == X) rS1 = r_temp;
-		sintegral += time_delta / 2 * r_temp * ((n != X) ? 2 : 1);
+		// Computing the mean
+		float m = 0;
+		{
+			// First term of the mean
+			m = r_step * expf(-param_a * (time_delta));
+
+			// Second term of the mean (formula for the integral)
+			m += expf(-param_a * (time_delta)) * theta[n - 1] +
+				1.0f * theta[n] *  time_delta / 2;
+		}
+
+		// Computing the noise
+		float noise = 0;
+		{
+			float random = curand_normal(&localState);
+			noise = noise_sensitivity * random;
+		}
+
+		r_step = m + noise;
+
+		integral += 0.5f * (r_prev_step + r_step) * time_delta;	
 	}
-	float P_ana = A * expf(-B * rS1);
-	return expf(-sintegral) * fmaxf(0.0f, P_ana - K);
+	float P_ana = A * expf(-B * r_step);
+	return expf(-integral) * fmaxf(0.0f, P_ana - K);
 }
 
 __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, float S2, float K, float *P, float *f, float *theta,
 					 float starting_r, float time_delta, curandStateXORWOW_t *states) {
-	// derivative of P(S_1,S_2)
-	// we need: derivative of A and derivative of r
-	int tid = threadIdx.x;
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
 	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
 	int S1step = roundf(S1 / time_delta);
@@ -231,7 +236,7 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 
 int main() {
 	// Question 1 :
-	int steps = 10;
+	int steps = 20;
 
 	float param_sigma = 0.1;
 	float param_a = 1.0;
@@ -268,13 +273,13 @@ int main() {
 		float avg = *sum / (NB * NTPB);
 
 		P[i] = avg;
-		// std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
+		std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
 
 		// f(0, T)
 		if (i != 0) {
 			float delta = logf(avg) - logf(avg_prev);
 			f[i] = -(delta / delta_T);
-			// std::cout << "f(0, " << T_i << ") = " << F[i] << std::endl;
+			std::cout << "f(0, " << T_i << ") = " << f[i] << std::endl;
 		}
 
 		avg_prev = avg;
@@ -335,7 +340,7 @@ int main() {
 		cudaDeviceSynchronize();
 		diff_approx -= (*sum / (NB * NTPB)) / (2*diff);
 
-		std::cout << "dev ZCB(5, 10, e^-0.1) = " << avg_dev << " dev numerical method = " << diff_approx << std::endl;
+		std::cout << "dev ZCB(5, 10, e^-0.1) = " << avg_dev << std::endl << "dev numerical method = " << diff_approx << std::endl;
 	}
 
 	cudaFree(sum);
@@ -344,115 +349,5 @@ int main() {
 	cudaFree(f);
 	cudaFree(theta);
 
-	return 0;
-}
-
-int main_old() {
-	int n = NB * NTPB;
-	int steps = 30;
-	float sigma = 0.1;
-	float s = 0;
-	float T = 10;
-	float dt = ((float) T) / ((float) steps);
-	float rzero = 0.012;
-	float a = 1.0;
-	float *PGPU;
-	float *FGPU;
-	float *thetaGPU;
-	float *ZBCGPU;
-	float *ZBCGPUD;
-	float ZBC;
-	float ZBC2;
-	int num_el = steps + 1;
-	float *P = (float *) malloc(sizeof(float) * num_el);
-	float *F = (float *) malloc(sizeof(float) * num_el);
-
-	cudaMalloc(&PGPU, sizeof(float));
-	cudaMalloc(&thetaGPU, sizeof(float) * num_el);
-	cudaMemset(PGPU, 0, sizeof(float));
-	curandStateXORWOW_t *states;
-	cudaMalloc(&states, n * sizeof(curandStateXORWOW_t));
-	cudaMalloc(&ZBCGPU, sizeof(float));
-	cudaMalloc(&ZBCGPUD, sizeof(float));
-	cudaMemset(ZBCGPU, 0, sizeof(float));
-	cudaMemset(ZBCGPUD, 0, sizeof(float));
-
-	init_curand_state_k<<<NB, NTPB>>>(states);
-	cudaDeviceSynchronize();
-
-	float PCPU, FCPU;
-	P[0] = 1;
-	F[0] = rzero;
-	for (int i = 1; i <= steps; i++) {
-		float t = dt * i;
-		std::cout << sigma << " " << a << " " << rzero << " " << s << " " << t << " " << dt << std::endl;
-		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([sigma, a, rzero, s, t, dt, states] __device__ {
-			return calculate_price(sigma, a, rzero, s, t, dt, states);
-		}, PGPU);
-		//Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,t,states,PGPU);
-		cudaDeviceSynchronize();
-		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
-
-		std::cout << "sum : " << PCPU << std::endl;
-		P[i] = PCPU / n;
-		std::cout << i << " : " << t << ", " << P[i] << std::endl;
-
-		cudaMemset(PGPU, 0, sizeof(float));
-	}
-
-	for (int i = 1; i <= num_el; i++) {
-		F[i] = -(logf(P[i]) - logf(P[i - 1])) / dt;
-	}
-	cudaMalloc(&FGPU, sizeof(float) * num_el);
-	cudaMalloc(&PGPU, sizeof(float) * num_el);
-	cudaMemcpy(FGPU, F, sizeof(float) * num_el, cudaMemcpyHostToDevice);
-	cudaMemcpy(PGPU, P, sizeof(float) * num_el, cudaMemcpyHostToDevice);
-	theta_k<<<1,num_el>>>(sigma, a, FGPU, steps, dt, thetaGPU);
-
-	// float S1,float S2,float K,float* f,float* p,float* theta,float sigma,float dtstep,float dt,float a, float rs,curandStateXORWOW_t* states,float *ZBC)
-	/*ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPU);
-	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
-	printf("ZBC value is %f\n",ZBC/n);*/
-	/*theta_k<<<1,steps>>>(FGPU,sigma-0.0001,a,dt,steps,thetaGPU);
-	ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma-0.0001,dt,a,rzero,states,ZBCGPU);
-	cudaDeviceSynchronize();
-	cudaMemcpy(&ZBC,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
-	cudaMemset(ZBCGPU,0,sizeof(float));
-	theta_k<<<1,steps>>>(FGPU,sigma+0.0001,a,dt,steps,thetaGPU);
-	ZBC_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma+0.0001,dt,a,rzero,states,ZBCGPU);
-	cudaDeviceSynchronize();
-	cudaMemcpy(&ZBC2,ZBCGPU,sizeof(float),cudaMemcpyDeviceToHost);
-	ZBC /= n;
-	ZBC2 /= n;
-	printf("Derivative with first method of ZBC is %f\n",(ZBC2-ZBC)/(2*0.0001));
-	theta_k<<<1,steps>>>(FGPU,sigma,a,dt,steps,thetaGPU);
-	ZBC_derivative_k<<<NB,NTPB,NTPB*sizeof(float)>>>(5,10,expf(-0.1),FGPU,PGPU,thetaGPU,sigma,dt,a,rzero,states,ZBCGPUD);
-	cudaDeviceSynchronize();
-	cudaMemcpy(&ZBC,ZBCGPUD,sizeof(float),cudaMemcpyDeviceToHost);
-	printf("Derivative of ZBC is %f\n",ZBC/n);*/
-	/*float i = T;
-	while(i <= 10)
-	{
-		dt =  ((float)i)/((float)steps);
-		Bond_Price_k<<<NB,NTPB,2*NTPB*sizeof(float)>>>(sigma,dt,a,rzero,s,i,states,PGPU,FGPU);
-
-		cudaDeviceSynchronize();
-		cudaMemcpy(&PCPU, PGPU, sizeof(float), cudaMemcpyDeviceToHost);
-    	cudaMemcpy(&FCPU, FGPU, sizeof(float), cudaMemcpyDeviceToHost);
-
-		// divide out by number of total threads
-		printf("round %f %f %f\n",i,PCPU/n,FCPU/n);
-		cudaMemset(PGPU,0,sizeof(float));
-		cudaMemset(FGPU,0,sizeof(float));
-		i += 0.5;
-	}*/
-	cudaFree(PGPU);
-	cudaFree(FGPU);
-	cudaFree(thetaGPU);
-	cudaFree(ZBCGPU);
-	cudaFree(states);
-	cudaFree(ZBCGPUD);
-	free(P);
-	free(F);
 	return 0;
 }
