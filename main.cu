@@ -185,51 +185,68 @@ __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float
 __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, float S2, float K, float *P, float *f, float *theta,
 					 float starting_r, float time_delta, curandStateXORWOW_t *states) {
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
-	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
+	float noise_sensitivity = sqrt(param_sigma * param_sigma * (1 - expf(-2 * param_a * time_delta)) / (2 * param_a));
+	
+	// convert S1 and S2 to the closest step.
 	int S1step = roundf(S1 / time_delta);
 	int S2step = roundf(S2 / time_delta);
+	// Values A(S1,S2) and B(S1,S2)
 	float B = (1 - expf(-param_a * (S2 - S1))) / param_a;
 	float A = P[S2step] / P[S1step] * expf(B * f[S1step] - (param_sigma * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
-	float rS1;
 
-	// calculates integral of r_s from 0 to S_1
 	int X = S1 / time_delta;
-	float r_temp = starting_r;
-	float temp_dev = 0;
+	float r_step = starting_r;
+	float dev_step = 0;
 	float dev_integral = 0;
-	float sintegral = time_delta / 2 * starting_r;
+	float integral = 0;
 
 	for (int n = 1; n <= X; n++) {
-		float integral = 0;
-		float2 G = curand_normal2(&localState);
-		integral += expf(-param_a * (time_delta)) * theta[n - 1];
-		integral += 1.0f * theta[n];
-		integral *= time_delta / 2;
+		r_prev_step = r_step;
+		dev_prev_step = dev_step;
+		// Computing the mean
+		float m = 0;
+		{
+			// First term of the mean
+			m = r_step * expf(-param_a * (time_delta));
 
-		float m = r_temp * expf(-param_a * (time_delta)) + integral;
-		float sigmaBig = sqrtf(param_sigma * param_sigma * (1 - expf(-2 * param_a * (time_delta))) / (2 * param_a));
-		r_temp = m + sigmaBig * G.x;
-		if (n == X) rS1 = r_temp;
-		sintegral += time_delta / 2 * r_temp * ((n != X) ? 2 : 1);
+			// Second term of the mean (formula for the integral)
+			m = expf(-param_a * (time_delta)) * theta[n - 1] +
+				1.0f * theta[n] * time_delta / 2;
+		}
+			
+		// Computing the noise
+		float noise = 0;
+		float random = curand_normal(&localState);
+		{
+			noise = noise_sensitivity * random;
+		}
+		r_step = m + noise;
 
-		float w = n * time_delta;
-		float m_dev = temp_dev * expf(-param_a * (time_delta)) + 
-							(2 * param_sigma * expf(-param_a * w) * (cosh(param_a * w) - cosh(param_a * (w - time_delta)))) / (
-			              		param_a * param_a);
-		temp_dev = m_dev + sigmaBig / param_sigma * G.x;
-		dev_integral += time_delta / 2 * temp_dev * ((n != X) ? 2 : 1);
+		integral += 0.5f * (r_prev_step + r_step) * time_delta;	
+
+		float step_time = n * time_delta;
+
+		// Compute derivative
+		float m_dev = dev_step * expf(-param_a * (time_delta)) + 
+							(2 * param_sigma * expf(-param_a * step_time) * 
+								(cosh(param_a * step_time) - cosh(param_a * (step_time - time_delta)))) / (
+			              			param_a * param_a);
+		dev_step = m_dev + noise_sensitivity / param_sigma * random;
+		// Integral of derivate of r(s) term
+		dev_integral += 0.5f * (dev_prev_step + dev_step) * time_delta;	
 	}
-	float P_ana = A * expf(-B * rS1);
+	float P_ana = A * expf(-B * r_step);
 
 
-	float result = fmaxf(0.0f, (P_ana - K));
-	result *= dev_integral * expf(-sintegral);
+	float result = fmaxf(0.0f, (P_ana - K)) * dev_integral * expf(-integral);
 
 	if (P_ana > K) {
 		float Adev = 0;
+		
 		Adev = A * (-(2 * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
-		float Pdev = A * expf(-B * rS1) * (-B) * temp_dev + Adev * expf(-B * rS1);
-		return Pdev * expf(-sintegral) - result;
+		float Pdev = A * expf(-B * r_step) * (-B) * temp_dev + Adev * expf(-B * r_step);
+
+		return Pdev * expf(-integral) - result;
 	} 
 	return -result; 
 }
