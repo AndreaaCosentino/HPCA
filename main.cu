@@ -181,7 +181,9 @@ __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float
 
 		integral += 0.5f * (r_prev_step + r_step) * time_delta;	
 	}
+	// P(S1,S2)
 	float P_ana = A * expf(-B * r_step);
+	
 	return expf(-integral) * fmaxf(0.0f, P_ana - K);
 }
 
@@ -238,11 +240,13 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 		// Integral of derivate of r(s) term
 		dev_integral += 0.5f * (dev_prev_step + dev_step) * time_delta;	
 	}
+	// P(S1,S2)
 	float P_ana = A * expf(-B * r_step);
 
 
 	float result = fmaxf(0.0f, (P_ana - K)) * dev_integral * expf(-integral);
 
+	// If  P(S1,S2) > K add the term, otherwise return
 	if (P_ana > K) {
 		float Adev = 0;
 		
@@ -251,6 +255,7 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 
 		return Pdev * expf(-integral) - result;
 	} 
+
 	return -result; 
 }
 
