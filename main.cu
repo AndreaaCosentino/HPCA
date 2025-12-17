@@ -163,8 +163,11 @@ __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float
 			m = r_step * expf(-param_a * (time_delta));
 
 			// Second term of the mean (formula for the integral)
-			m += expf(-param_a * (time_delta)) * theta[n - 1] +
-				1.0f * theta[n] *  time_delta / 2;
+			m += 
+				(
+					expf(-param_a * (time_delta)) * theta[n - 1] +
+						1.0f * theta[n] 
+				) * time_delta / 2;
 		}
 
 		// Computing the noise
@@ -201,8 +204,8 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 	float integral = 0;
 
 	for (int n = 1; n <= X; n++) {
-		r_prev_step = r_step;
-		dev_prev_step = dev_step;
+		float r_prev_step = r_step;
+		float dev_prev_step = dev_step;
 		// Computing the mean
 		float m = 0;
 		{
@@ -210,7 +213,7 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 			m = r_step * expf(-param_a * (time_delta));
 
 			// Second term of the mean (formula for the integral)
-			m = expf(-param_a * (time_delta)) * theta[n - 1] +
+			m += expf(-param_a * (time_delta)) * theta[n - 1] +
 				1.0f * theta[n] * time_delta / 2;
 		}
 			
@@ -244,7 +247,7 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 		float Adev = 0;
 		
 		Adev = A * (-(2 * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
-		float Pdev = A * expf(-B * r_step) * (-B) * temp_dev + Adev * expf(-B * r_step);
+		float Pdev = A * expf(-B * r_step) * (-B) * dev_step + Adev * expf(-B * r_step);
 
 		return Pdev * expf(-integral) - result;
 	} 
