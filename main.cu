@@ -114,17 +114,17 @@ __global__ void tree_sum(CallableValue val, float *out) {
 
 // Theta functions not tested
 
-__device__ float theta(float param_sigma, float param_a, float *f, int f_length, int index, float delta_T) {
-	float T = delta_T * index;
-	float result = param_a * f[index] + param_sigma * param_sigma * (1 - expf(-2 * param_a * T)) / (2 * param_a);
+__device__ float theta(float param_sigma, float param_a, float *f, int f_length, int at_timestep, float delta_T) {
+	float T = delta_T * at_timestep;
+	float result = param_a * f[at_timestep] + param_sigma * param_sigma * (1 - expf(-2 * param_a * T)) / (2 * param_a);
 
 	// Calculate the derivative of f differently based on whether we are on the edge of the array
-	if (index > 0 && index < f_length - 1)
-		return result + (f[index + 1] - f[index - 1]) / (2 * delta_T);
-	if (index == 0)
-		return result + (f[index + 1] - f[index]) / delta_T;
-	if (index == f_length - 1)
-		return result + (f[index] - f[index - 1]) / delta_T;
+	if (at_timestep > 0 && at_timestep < f_length - 1)
+		return result + (f[at_timestep + 1] - f[at_timestep - 1]) / (2 * delta_T);
+	if (at_timestep == 0)
+		return result + (f[at_timestep + 1] - f[at_timestep]) / delta_T;
+	if (at_timestep == f_length - 1)
+		return result + (f[at_timestep] - f[at_timestep - 1]) / delta_T;
 
 	return -1;
 }
@@ -137,55 +137,41 @@ __global__ void theta_k(float param_sigma, float param_a, float *f, int f_length
 	}
 }
 
-__global__ void ZBC_k(float S1, float S2, float K, float *f, float *p, float *theta, float sigma, float dt, float a,
-                      float rs, curandStateXORWOW_t *states, float *ZBC) {
+__device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float S2, float K, float *P, float *f, float *theta,
+					 float starting_r, float time_delta, curandStateXORWOW_t *states) {
 	// Calculate A and B to get P
 	// Simulate r, and obtain the integral (can use function of before with a minor tweak)
 	// put everything together and do reduction as usual
-	int tid = threadIdx.x;
-	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
 	// convert S1 and S2 to the closest step.
-	int S1step = roundf(S1 / dt);
-	int S2step = roundf(S2 / dt);
-	float B = (1 - expf(-a * (S2 - S1))) / a;
-	float A = p[S2step] / p[S1step] * expf(B * f[S1step] - (sigma * sigma * (1 - expf(-2 * a * S2))) / (4 * a) * B * B);
+	int S1step = roundf(S1 / time_delta);
+	int S2step = roundf(S2 / time_delta);
+	float B = (1 - expf(-param_a * (S2 - S1))) / param_a;
+	float A = P[S2step] / P[S1step] * expf(B * f[S1step] - (param_sigma * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
 	//printf("%d %d %f %f %f \n",S2step,S1step,p[S2step],p[S1step],f[S1step]);
 	float rS1;
 	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
 
-	float sintegral = dt / 2 * rs;
+	float sintegral = time_delta / 2 * starting_r;
 
 	// maybe not elegant but for now it will suffice
-	int X = S1 / dt;
-	float r_temp = rs;
+	int X = S1 / time_delta;
+	float r_temp = starting_r;
 	for (int f = 1; f <= X; f++) {
 		float integral = 0;
 		float2 G = curand_normal2(&localState);
-		integral += expf(-a * (dt)) * theta[f - 1];
+		integral += expf(-param_a * (time_delta)) * theta[f - 1];
 		integral += 1.0f * theta[f];
-		integral *= dt / 2;
+		integral *= time_delta / 2;
 
-		float m = r_temp * expf(-a * (dt)) + integral;
-		float sigmaBig = sqrtf(sigma * sigma * (1 - expf(-2 * a * (dt))) / (2 * a));
+		float m = r_temp * expf(-param_a * (time_delta)) + integral;
+		float sigmaBig = sqrtf(param_sigma * param_sigma * (1 - expf(-2 * param_a * (time_delta))) / (2 * param_a));
 		r_temp = m + sigmaBig * G.x;
 		if (f == X) rS1 = r_temp;
-		sintegral += dt / 2 * r_temp * ((f != X) ? 2 : 1);
+		sintegral += time_delta / 2 * r_temp * ((f != X) ? 2 : 1);
 	}
-	float P = A * expf(-B * rS1);
-	sdata[tid] = expf(-sintegral) * fmaxf(0.0f, P - K);
-	__syncthreads();
-
-	for (int k = blockDim.x / 2; k > 0; k /= 2) {
-		if (tid < k) {
-			sdata[tid] += sdata[k + tid];
-		}
-		__syncthreads();
-	}
-
-	if (tid == 0) {
-		atomicAdd(ZBC, sdata[0]);
-	}
+	float P_ = A * expf(-B * rS1);
+	return expf(-sintegral) * fmaxf(0.0f, P_ - K);
 }
 
 __global__ void ZBC_derivative_k(float S1, float S2, float K, float *f, float *p, float *theta, float sigma, float dt,
@@ -269,6 +255,8 @@ int main() {
 	init_curand_state_k<<<NB, NTPB>>>(states);
 	cudaDeviceSynchronize();
 
+	float *P;
+	cudaMallocManaged(&P, steps * sizeof(float));
 	float *f;
 	cudaMallocManaged(&f, steps * sizeof(float));
 
@@ -289,6 +277,7 @@ int main() {
 
 		float avg = *sum / (NB * NTPB);
 
+		P[i] = avg;
 		// std::cout << "P(0, " << T_i << ") = " << avg << std::endl;
 
 		// f(0, T)
@@ -313,8 +302,19 @@ int main() {
 		std::cout << "theta(" << T_i << ") = " << theta[i] << std::endl;
 	}
 
+	// Question 2.b
+	{
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, P, f, theta, states] __device__ {
+			return calculate_ZBC(param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, 0.01, states);
+		}, sum);
+
+		float avg = *sum / (NB * NTPB);
+		std::cout << "ZCB(5, 10, e^-0.1) = " << avg << std::endl;
+	}
+
 	cudaFree(sum);
 	cudaFree(states);
+	cudaFree(P);
 	cudaFree(f);
 	cudaFree(theta);
 
