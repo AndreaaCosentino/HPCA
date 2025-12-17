@@ -157,86 +157,76 @@ __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float
 	// maybe not elegant but for now it will suffice
 	int X = S1 / time_delta;
 	float r_temp = starting_r;
-	for (int f = 1; f <= X; f++) {
+	for (int n = 1; n <= X; n++) {
 		float integral = 0;
 		float2 G = curand_normal2(&localState);
-		integral += expf(-param_a * (time_delta)) * theta[f - 1];
-		integral += 1.0f * theta[f];
+		integral += expf(-param_a * (time_delta)) * theta[n - 1];
+		integral += 1.0f * theta[n];
 		integral *= time_delta / 2;
 
 		float m = r_temp * expf(-param_a * (time_delta)) + integral;
 		float sigmaBig = sqrtf(param_sigma * param_sigma * (1 - expf(-2 * param_a * (time_delta))) / (2 * param_a));
 		r_temp = m + sigmaBig * G.x;
-		if (f == X) rS1 = r_temp;
-		sintegral += time_delta / 2 * r_temp * ((f != X) ? 2 : 1);
+		if (n == X) rS1 = r_temp;
+		sintegral += time_delta / 2 * r_temp * ((n != X) ? 2 : 1);
 	}
-	float P_ = A * expf(-B * rS1);
-	return expf(-sintegral) * fmaxf(0.0f, P_ - K);
+	float P_ana = A * expf(-B * rS1);
+	return expf(-sintegral) * fmaxf(0.0f, P_ana - K);
 }
 
-__global__ void ZBC_derivative_k(float S1, float S2, float K, float *f, float *p, float *theta, float sigma, float dt,
-                                 float a, float rs, curandStateXORWOW_t *states, float *ZBC) {
+__device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, float S2, float K, float *P, float *f, float *theta,
+					 float starting_r, float time_delta, curandStateXORWOW_t *states) {
 	// derivative of P(S_1,S_2)
 	// we need: derivative of A and derivative of r
 	int tid = threadIdx.x;
-	extern __shared__ float sdata[];
 	curandStateXORWOW_t localState = states[threadIdx.x + blockIdx.x * blockDim.x];
 	// need to calculate P(S_1,S_2) otherwise I cant decide which path to take
-	int S1step = roundf(S1 / dt);
-	int S2step = roundf(S2 / dt);
-	float B = (1 - expf(-a * (S2 - S1))) / a;
-	float A = p[S2step] / p[S1step] * expf(B * f[S1step] - (sigma * sigma * (1 - expf(-2 * a * S2))) / (4 * a) * B * B);
+	int S1step = roundf(S1 / time_delta);
+	int S2step = roundf(S2 / time_delta);
+	float B = (1 - expf(-param_a * (S2 - S1))) / param_a;
+	float A = P[S2step] / P[S1step] * expf(B * f[S1step] - (param_sigma * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
 	float rS1;
 
 	// calculates integral of r_s from 0 to S_1
-	int X = S1 / dt;
-	float r_temp = rs;
+	int X = S1 / time_delta;
+	float r_temp = starting_r;
 	float temp_dev = 0;
 	float dev_integral = 0;
-	float sintegral = dt / 2 * rs;
-	for (int f = 1; f <= X; f++) {
-		float2 G = curand_normal2(&localState);
+	float sintegral = time_delta / 2 * starting_r;
+
+	for (int n = 1; n <= X; n++) {
 		float integral = 0;
+		float2 G = curand_normal2(&localState);
+		integral += expf(-param_a * (time_delta)) * theta[n - 1];
+		integral += 1.0f * theta[n];
+		integral *= time_delta / 2;
 
-		integral += expf(-a * (dt)) * theta[f - 1];
-		integral += 1.0f * theta[f];
-		integral *= dt / 2;
-
-		float m = r_temp * expf(-a * (dt)) + integral;
-		float sigmaBig = sqrtf(sigma * sigma * (1 - expf(-2 * a * (dt))) / (2 * a));
+		float m = r_temp * expf(-param_a * (time_delta)) + integral;
+		float sigmaBig = sqrtf(param_sigma * param_sigma * (1 - expf(-2 * param_a * (time_delta))) / (2 * param_a));
 		r_temp = m + sigmaBig * G.x;
-		if (f == X) rS1 = r_temp;
-		sintegral += dt / 2 * r_temp * ((f != X) ? 2 : 1);
+		if (n == X) rS1 = r_temp;
+		sintegral += time_delta / 2 * r_temp * ((n != X) ? 2 : 1);
 
-		float w = f * dt;
-		float m_dev = temp_dev * expf(-a * (dt)) + (2 * sigma * expf(-a * w) * (cosh(a * w) - cosh(a * (w - dt)))) / (
-			              a * a);
-		temp_dev = m_dev + sigmaBig / sigma * G.x;
-		dev_integral += dt / 2 * temp_dev * ((f != X) ? 2 : 1);
+		float w = n * time_delta;
+		float m_dev = temp_dev * expf(-param_a * (time_delta)) + 
+							(2 * param_sigma * expf(-param_a * w) * (cosh(param_a * w) - cosh(param_a * (w - time_delta)))) / (
+			              		param_a * param_a);
+		temp_dev = m_dev + sigmaBig / param_sigma * G.x;
+		dev_integral += time_delta / 2 * temp_dev * ((n != X) ? 2 : 1);
 	}
-	float P = A * expf(-B * rS1);
+	float P_ana = A * expf(-B * rS1);
 
 
-	float result = fmaxf(0.0f, (P - K));
+	float result = fmaxf(0.0f, (P_ana - K));
 	result *= dev_integral * expf(-sintegral);
 
-	if (P > K) {
+	if (P_ana > K) {
 		float Adev = 0;
-		Adev = A * (-(2 * sigma * (1 - expf(-2 * a * S2))) / (4 * a) * B * B);
+		Adev = A * (-(2 * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
 		float Pdev = A * expf(-B * rS1) * (-B) * temp_dev + Adev * expf(-B * rS1);
-		sdata[tid] = Pdev * expf(-sintegral) - result;
-	} else { sdata[tid] = -result; }
-	__syncthreads();
-	for (int k = blockDim.x / 2; k > 0; k /= 2) {
-		if (tid < k) {
-			sdata[tid] += sdata[k + tid];
-		}
-		__syncthreads();
-	}
-
-	if (tid == 0) {
-		atomicAdd(ZBC, sdata[0]);
-	}
+		return Pdev * expf(-sintegral) - result;
+	} 
+	return -result; 
 }
 
 int main() {
@@ -302,7 +292,7 @@ int main() {
 		std::cout << "theta(" << T_i << ") = " << theta[i] << std::endl;
 	}
 
-	// Question 2.b
+	// Question 2.b :
 	{
 		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, P, f, theta, states] __device__ {
 			return calculate_ZBC(param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, 0.01, states);
@@ -311,6 +301,7 @@ int main() {
 		float avg = *sum / (NB * NTPB);
 		std::cout << "ZCB(5, 10, e^-0.1) = " << avg << std::endl;
 	}
+
 
 	cudaFree(sum);
 	cudaFree(states);
