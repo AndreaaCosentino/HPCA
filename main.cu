@@ -148,7 +148,7 @@ __device__ float calculate_ZBC(float param_sigma, float param_a, float S1, float
 	int S2step = roundf(S2 / time_delta);
 	float B = (1 - expf(-param_a * (S2 - S1))) / param_a;
 	float A = P[S2step] / P[S1step] * expf(B * f[S1step] - (param_sigma * param_sigma * (1 - expf(-2 * param_a * S2))) / (4 * param_a) * B * B);
-	//printf("%d %d %f %f %f \n",S2step,S1step,p[S2step],p[S1step],f[S1step]);
+	//printf("%d %d %f %f %f \n",S2step,S1step,P[S2step],P[S1step],f[S1step]);
 	float rS1;
 	// for P I still miss r(S1). Lets calculate integral of r(t). We are gonna calculate r(S1) during it.
 
@@ -231,7 +231,7 @@ __device__ float calculate_ZBC_dev(float param_sigma, float param_a, float S1, f
 
 int main() {
 	// Question 1 :
-	int steps = 30;
+	int steps = 10;
 
 	float param_sigma = 0.1;
 	float param_a = 1.0;
@@ -294,14 +294,49 @@ int main() {
 
 	// Question 2.b :
 	{
-		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, P, f, theta, states] __device__ {
-			return calculate_ZBC(param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, 0.01, states);
+		*sum = 0.0f;
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, P, f, theta,delta_T, states] __device__ {
+			return calculate_ZBC(param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, delta_T, states);
 		}, sum);
-
+		cudaDeviceSynchronize();
 		float avg = *sum / (NB * NTPB);
 		std::cout << "ZCB(5, 10, e^-0.1) = " << avg << std::endl;
 	}
 
+	//Question 3 :
+	{	
+		*sum = 0.0f;
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([param_sigma, param_a, P, f, theta, delta_T, states] __device__ {
+			return calculate_ZBC_dev(param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, delta_T, states);
+		}, sum);
+		cudaDeviceSynchronize();
+		float avg_dev = *sum / (NB * NTPB);
+
+
+		*sum = 0.0f;
+		float diff = 0.0001;
+		float temp_param_sigma = param_sigma + diff;
+		theta_k<<<1, steps>>>(temp_param_sigma, param_a, f, steps, delta_T, theta);
+		cudaDeviceSynchronize();
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([temp_param_sigma, param_a, P, f, theta, delta_T, states] __device__ {
+			return calculate_ZBC(temp_param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, delta_T, states);
+		}, sum);
+		cudaDeviceSynchronize();
+		float diff_approx = (*sum / (NB * NTPB)) / (2*diff);
+
+
+		temp_param_sigma = param_sigma - diff;
+		*sum = 0.0f;
+		theta_k<<<1, steps>>>(temp_param_sigma, param_a, f, steps, delta_T, theta);
+		cudaDeviceSynchronize();
+		tree_sum<<<NB, NTPB, NTPB * sizeof(float)>>>([temp_param_sigma, param_a, P, f, theta,delta_T, states] __device__ {
+			return calculate_ZBC(temp_param_sigma, param_a, 5, 10, expf(-0.1), P, f, theta, 0.012, delta_T, states);
+		}, sum);
+		cudaDeviceSynchronize();
+		diff_approx -= (*sum / (NB * NTPB)) / (2*diff);
+
+		std::cout << "dev ZCB(5, 10, e^-0.1) = " << avg_dev << " dev numerical method = " << diff_approx << std::endl;
+	}
 
 	cudaFree(sum);
 	cudaFree(states);
