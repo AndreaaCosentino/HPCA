@@ -114,16 +114,17 @@ __global__ void tree_sum(CallableValue val, float *out) {
 
 // Theta functions not tested
 
-__device__ float theta(float param_sigma, float param_a, float *f, int f_length, float T, float delta_T) {
-	int s = roundf(T / delta_T);
-	float result = param_a * f[s] + param_sigma * param_sigma * (1 - expf(-2 * param_a * T)) / (2 * param_a);
+__device__ float theta(float param_sigma, float param_a, float *f, int f_length, int index, float delta_T) {
+	float T = delta_T * index;
+	float result = param_a * f[index] + param_sigma * param_sigma * (1 - expf(-2 * param_a * T)) / (2 * param_a);
 
-	if (s > 0 && s < f_length - 1)
-		return result + (f[s + 1] - f[s - 1]) / (2 * delta_T);
-	if (s == 0)
-		return result + (f[s + 1] - f[s]) / delta_T;
-	if (s == f_length - 1)
-		return result + (f[s] - f[s - 1]) / delta_T;
+	// Calculate the derivative of f differently based on whether we are on the edge of the array
+	if (index > 0 && index < f_length - 1)
+		return result + (f[index + 1] - f[index - 1]) / (2 * delta_T);
+	if (index == 0)
+		return result + (f[index + 1] - f[index]) / delta_T;
+	if (index == f_length - 1)
+		return result + (f[index] - f[index - 1]) / delta_T;
 
 	return -1;
 }
@@ -132,8 +133,7 @@ __global__ void theta_k(float param_sigma, float param_a, float *f, int f_length
 	int tid = threadIdx.x + blockDim.x * blockIdx.x;
 
 	if (tid < f_length) {
-		float T = tid * delta_T;
-		out[tid] = theta(param_sigma, param_a, f, f_length, T, delta_T);
+		out[tid] = theta(param_sigma, param_a, f, f_length, tid, delta_T);
 	}
 }
 
